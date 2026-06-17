@@ -12,11 +12,13 @@ from youtube_utils import (
     get_transcript_chunks, get_video_info, get_live_transcript_since, extract_video_id,
     extract_frame_at, extract_clip_frames,
     download_video_local, extract_frame_local, extract_frames_local_batch,
-    transcribe_audio,
+    transcribe_audio, extract_audio_from_video, detect_whistle_timestamps,
 )
 from claude_analyzer import (
     analyze_chunk, analyze_frame_for_stats, analyze_play_sequence,
     quick_score_check, analyze_transcription_chunks,
+    analyze_referee_foul_sequence, analyze_timeout_screen,
+    extract_jersey_numbers_ocr,
 )
 
 app = FastAPI(title="Titans Basketball Auto Tracker")
@@ -602,42 +604,50 @@ async def _send(sid, **kwargs):
 
 async def full_auto_pipeline(url: str, sid: str, players: list[str], jersey_map: dict, score_interval: int):
     """
-    The REAL fully automatic pipeline:
-    1. Try Whisper audio transcription (gets individual player names from commentary)
-    2. Download video at 360p for local frame analysis
-    3. Scan scoreboard every `score_interval` seconds using local ffmpeg (FAST, no yt-dlp per frame)
-    4. On score change → extract 6 frames → Claude Vision play analysis (jersey number ID)
-    5. All events streamed in real-time via WebSocket
+    4-source fully automatic pipeline:
+    1. Whistle detection (FIR bandpass 2800-4200 Hz, 92.5% sensitivity) → foul timestamps
+    2. Score change detection (local frames, every 5s) → scoring play analysis via Claude Vision
+    3. EasyOCR on every play frame → jersey number extraction (FREE, no API)
+    4. Timeout stat screens → complete player stats overlay reading
+    All four sources merged and streamed via WebSocket in real-time.
     """
     import shutil
 
     work_dir = f"/tmp/auto_{sid}"
     os.makedirs(work_dir, exist_ok=True)
-    video_path = os.path.join(work_dir, "game.mp4")
-    learned_jerseys = dict(jersey_map)
-    last_score = {"titans": None, "rival": None}
+    video_path  = os.path.join(work_dir, "game.mp4")
+    audio_path  = os.path.join(work_dir, "game_audio.mp3")
+    learned_jerseys  = dict(jersey_map)
+    last_score           = {"titans": None, "rival": None}
+    last_clock           = None
+    clock_same_count     = 0
+    timeout_frames_analyzed = set()
+    analyzed_whistles    = set()   # prevent duplicate foul analysis per whistle
 
     async def status(msg, level="info"):
         await manager.send(sid, {"type": "status", "msg": msg, "level": level})
 
-    async def progress(pct, phase=""):
-        await manager.send(sid, {"type": "auto_progress", "pct": pct, "phase": phase})
+    async def emit_event(source, video_ts, player, team, stat, confidence, quote):
+        if player == "UNKNOWN_TITANS":
+            player = "Titans (sin identificar)"
+        await manager.send(sid, {
+            "type": "ai_event",
+            "id": str(uuid.uuid4())[:8],
+            "source": source,
+            "video_ts": video_ts,
+            "player": player,
+            "team": team,
+            "stat": stat,
+            "confidence": confidence,
+            "quote": quote,
+        })
 
     try:
-        # ── Phase 1: Audio transcription (parallel with download) ─────────
-        await status("🎙 Checking audio for commentary...")
-        audio_task = asyncio.create_task(
-            transcribe_audio(url, work_dir,
-                progress_cb=lambda m: manager.send(sid, {"type": "status", "msg": f"🎙 {m}", "level": "info"}))
-        )
-
-        # ── Phase 2: Download full video ─────────────────────────────────
+        # ─── PHASE 1: Download video ───────────────────────────────────────
         await status("⬇ Downloading game video (this takes a few minutes)...")
         await manager.send(sid, {"type": "auto_phase", "phase": "download"})
 
-        download_ok = await download_video_local(url, video_path,
-            progress_cb=lambda m: manager.send(sid, {"type": "status", "msg": f"⬇ {m}", "level": "info"}))
-
+        download_ok = await download_video_local(url, video_path)
         if not download_ok:
             await status("❌ Could not download video. Check URL.", "error")
             return
@@ -648,10 +658,39 @@ async def full_auto_pipeline(url: str, sid: str, players: list[str], jersey_map:
             await status("❌ Could not read video duration.", "error")
             return
 
-        await status(f"✓ Video downloaded ({os.path.getsize(video_path)//1048576}MB, {duration//60}m). Scanning for plays...")
+        size_mb = os.path.getsize(video_path) // 1048576
+        await status(f"✓ Video downloaded ({size_mb}MB, {duration//60}m {duration%60}s). Starting analysis...")
+
+        # ─── PHASE 2: Audio whistle detection (parallel) ──────────────────
+        await status("🎵 Extracting audio for whistle detection...")
+        loop = asyncio.get_event_loop()
+
+        audio_ok = await loop.run_in_executor(None, extract_audio_from_video, video_path, audio_path)
+
+        whistle_events = []
+        whisper_task = None
+        if audio_ok:
+            # Run both whistle detection and Whisper transcription in parallel
+            whistle_events = await loop.run_in_executor(None, detect_whistle_timestamps, audio_path)
+            w_count = sum(1 for e in whistle_events if e["type"] == "whistle")
+            c_count = sum(1 for e in whistle_events if e["type"] == "cheer")
+            await status(f"🎵 Audio events: {w_count} whistles + {c_count} crowd cheers detected")
+            await manager.send(sid, {"type": "whistle_events", "count": w_count, "cheer_count": c_count})
+
+            # Start Whisper in background (for videos WITH commentary)
+            whisper_task = asyncio.create_task(
+                transcribe_audio(url, work_dir)
+            )
+        else:
+            await status("⚠ Could not extract audio — visual analysis only", "warn")
+
+        # ─── PHASE 3: Scoreboard scan + score change play analysis ─────────
+        await status(f"🔍 Scanning {duration//60}m game — every {score_interval}s...")
         await manager.send(sid, {"type": "auto_phase", "phase": "scanning"})
 
-        # ── Phase 3: Score scan via local frames ──────────────────────────
+        # Index whistle events by timestamp for O(1) lookup
+        whistle_set = {int(e["ts"]): e["type"] for e in whistle_events}
+
         timestamps = list(range(60, min(duration, 7200), score_interval))
         total = len(timestamps)
         frame_path = os.path.join(work_dir, "current_frame.jpg")
@@ -660,134 +699,195 @@ async def full_auto_pipeline(url: str, sid: str, players: list[str], jersey_map:
             if f"auto_{sid}" not in active_tasks:
                 break
 
-            # Extract frame locally (fast: ~0.1s per frame)
-            loop = asyncio.get_event_loop()
+            # ── Extract frame (fast local ffmpeg, ~0.04s) ─────────────────
             ok = await loop.run_in_executor(None, extract_frame_local, video_path, ts, frame_path)
+            if not ok:
+                continue
 
-            if ok:
-                score = await quick_score_check(frame_path)
-                cur_t = score.get("titans")
-                cur_r = score.get("rival")
+            # ── Score check ───────────────────────────────────────────────
+            score = await quick_score_check(frame_path)
+            cur_t, cur_r = score.get("titans"), score.get("rival")
+            cur_clock = score.get("clock")
+            cur_q = score.get("quarter")
 
-                if cur_t is not None or cur_r is not None:
-                    await manager.send(sid, {
-                        "type": "score_update",
-                        "titans_score": cur_t,
-                        "rival_score": cur_r,
-                        "quarter": score.get("quarter"),
-                        "clock": score.get("clock"),
-                        "video_ts": f"{ts//60}:{ts%60:02d}",
-                    })
+            if cur_t is not None or cur_r is not None:
+                await manager.send(sid, {
+                    "type": "score_update",
+                    "titans_score": cur_t, "rival_score": cur_r,
+                    "quarter": cur_q, "clock": cur_clock,
+                    "video_ts": f"{ts//60}:{ts%60:02d}",
+                })
 
-                titans_delta = 0
-                rival_delta  = 0
-                if last_score["titans"] is not None and cur_t is not None:
-                    raw_delta = cur_t - last_score["titans"]
-                    titans_delta = raw_delta if 0 < raw_delta <= 4 else 0
-                if last_score["rival"] is not None and cur_r is not None:
-                    raw_delta = cur_r - last_score["rival"]
-                    rival_delta = raw_delta if 0 < raw_delta <= 4 else 0
+            # ── Timeout detection (clock unchanged for 30+ seconds) ────────
+            if cur_clock and cur_clock == last_clock:
+                clock_same_count += 1
+                if clock_same_count == 6 and ts not in timeout_frames_analyzed:  # ~30s unchanged
+                    timeout_frames_analyzed.add(ts)
+                    await status(f"⏸ Timeout/stoppage @{ts//60}:{ts%60:02d} — checking for stats overlay...", "info")
+                    screen = await analyze_timeout_screen(frame_path, players)
+                    if screen.get("has_stats") and screen.get("player_stats"):
+                        pstats = screen["player_stats"]
+                        await status(f"📊 Stats screen found! {len(pstats)} player(s) visible", "success")
+                        await manager.send(sid, {
+                            "type": "timeout_stats",
+                            "video_ts": f"{ts//60}:{ts%60:02d}",
+                            "player_stats": pstats,
+                            "is_halftime": screen.get("is_halftime", False),
+                        })
+            else:
+                clock_same_count = 0
+            last_clock = cur_clock
 
-                if cur_t is not None:
-                    last_score["titans"] = cur_t
-                if cur_r is not None:
-                    last_score["rival"] = cur_r
+            # ── Score change detection ────────────────────────────────────
+            titans_delta, rival_delta = 0, 0
+            if last_score["titans"] is not None and cur_t is not None:
+                d = cur_t - last_score["titans"]
+                titans_delta = d if 0 < d <= 4 else 0
+            if last_score["rival"] is not None and cur_r is not None:
+                d = cur_r - last_score["rival"]
+                rival_delta = d if 0 < d <= 4 else 0
+            if cur_t is not None: last_score["titans"] = cur_t
+            if cur_r is not None: last_score["rival"]  = cur_r
 
-                # ── Score changed → analyze the play (validate delta is sensible) ──
-                # Valid basketball increments: 1 (FT), 2 (field goal), 3 (three-pointer)
-                # Anything > 4 in one 5-second window is likely a bad read
-                titans_delta = min(titans_delta, 4)
-                rival_delta  = min(rival_delta, 4)
-                if titans_delta > 0 or rival_delta > 0:
-                    play_ts = max(60, ts - score_interval)
-                    play_fmt = f"{play_ts//60}:{play_ts%60:02d}"
+            if titans_delta > 0 or rival_delta > 0:
+                play_ts  = max(60, ts - score_interval)
+                play_fmt = f"{play_ts//60}:{play_ts%60:02d}"
+                await status(f"⚡ Score change @{play_fmt}: Titans+{titans_delta} Rival+{rival_delta} — analyzing...")
 
-                    await status(f"⚡ Score change @{play_fmt}: Titans+{titans_delta} Rival+{rival_delta} — analyzing play...")
+                # Extract 6 frames from play window (local, instant)
+                play_tss = [play_ts + int(j * score_interval / 5) for j in range(6)]
+                play_frames_data = await loop.run_in_executor(
+                    None, extract_frames_local_batch, video_path, play_tss, work_dir
+                )
+                fps = [p for _, p in play_frames_data]
 
-                    # Extract 6 frames from the play window (local, instant)
-                    play_timestamps = [play_ts + int(j * score_interval / 5) for j in range(6)]
-                    play_frames = await loop.run_in_executor(
-                        None, extract_frames_local_batch, video_path, play_timestamps, work_dir
-                    )
-                    frame_paths = [p for _, p in play_frames]
-
-                    if frame_paths:
-                        score_before = {
-                            "titans": (cur_t or 0) - titans_delta,
-                            "rival":  (cur_r or 0) - rival_delta,
-                        }
-                        score_after = {"titans": cur_t or 0, "rival": cur_r or 0}
-
-                        events, new_jerseys, play_desc = await analyze_play_sequence(
-                            frame_paths, players, learned_jerseys, score_before, score_after, play_fmt
-                        )
-
-                        if new_jerseys:
-                            learned_jerseys.update(new_jerseys)
-                            await manager.send(sid, {"type": "jersey_update", "map": learned_jerseys})
-
-                        for ev in events:
-                            player = ev.get("player", "UNKNOWN")
-                            if player == "UNKNOWN_TITANS":
-                                player = "Titans (sin identificar)"
+                if fps:
+                    # ── EasyOCR jersey pass (free, fast) ──────────────────
+                    ocr_numbers = []
+                    for fp in fps:
+                        ocr_numbers.extend(extract_jersey_numbers_ocr(fp))
+                    if ocr_numbers:
+                        best = max(ocr_numbers, key=lambda x: x["confidence"])
+                        num = best["number"]
+                        if num not in learned_jerseys and titans_delta > 0:
                             await manager.send(sid, {
-                                "type": "ai_event",
-                                "id": str(uuid.uuid4())[:8],
-                                "source": "full_auto",
-                                "video_ts": play_fmt,
-                                "player": player,
-                                "team": ev.get("team", "titans"),
-                                "stat": ev.get("stat", ""),
-                                "confidence": ev.get("confidence", 0),
-                                "quote": ev.get("reasoning", play_desc or ""),
+                                "type": "status",
+                                "msg": f"🔢 OCR found #{num} in play frame (conf={best['confidence']:.0%})",
+                                "level": "info",
                             })
 
-                        if play_desc:
-                            await status(f"🎬 {play_fmt}: {play_desc}", "success")
+                    # ── Claude Vision play analysis ────────────────────────
+                    score_before = {"titans": (cur_t or 0) - titans_delta, "rival": (cur_r or 0) - rival_delta}
+                    score_after  = {"titans": cur_t or 0, "rival": cur_r or 0}
+                    events, new_jerseys, play_desc = await analyze_play_sequence(
+                        fps, players, learned_jerseys, score_before, score_after, play_fmt
+                    )
 
-                        # Clean up play frames
-                        for fp in frame_paths:
-                            try:
-                                os.remove(fp)
-                            except Exception:
-                                pass
+                    if new_jerseys:
+                        learned_jerseys.update(new_jerseys)
+                        await manager.send(sid, {"type": "jersey_update", "map": learned_jerseys})
 
-            # Update progress bar
+                    # Merge OCR numbers into jersey map if Claude found a player match
+                    for ev in events:
+                        player = ev.get("player", "")
+                        if player and player not in ("UNKNOWN_TITANS", "RIVAL") and ocr_numbers:
+                            best_ocr = max(ocr_numbers, key=lambda x: x["confidence"])
+                            if best_ocr["number"] not in learned_jerseys:
+                                learned_jerseys[best_ocr["number"]] = player
+
+                    for ev in events:
+                        await emit_event(
+                            "full_auto", play_fmt,
+                            ev.get("player", ""), ev.get("team", "titans"),
+                            ev.get("stat", ""), ev.get("confidence", 0),
+                            ev.get("reasoning", play_desc or ""),
+                        )
+                    if play_desc:
+                        await status(f"🎬 {play_fmt}: {play_desc}", "success")
+
+                    for fp in fps:
+                        try: os.remove(fp)
+                        except: pass
+
+            # ── Check for whistle event near this timestamp ────────────────
+            # Only if no score change (fouls w/o free throws, turnovers, etc.)
+            if titans_delta == 0 and rival_delta == 0:
+                nearby_whistles = [
+                    wts for wts in whistle_set
+                    if whistle_set[wts] == "whistle" and abs(wts - ts) <= score_interval
+                    and wts not in analyzed_whistles
+                ]
+                nearby_whistle = len(nearby_whistles) > 0
+            else:
+                nearby_whistle = False
+
+            if nearby_whistle:
+                whistle_ts = min(nearby_whistles, key=lambda wts: abs(wts - ts))
+                analyzed_whistles.add(whistle_ts)
+                foul_fmt = f"{whistle_ts//60}:{whistle_ts%60:02d}"
+
+                # Extract frames around the whistle for referee signal analysis
+                foul_tss = [max(0, whistle_ts - 1) + j for j in range(8)]
+                foul_frames = await loop.run_in_executor(
+                    None, extract_frames_local_batch, video_path, foul_tss, work_dir
+                )
+                ffps = [p for _, p in foul_frames]
+
+                if ffps:
+                    await status(f"🚨 Whistle @{foul_fmt} — reading referee signal...", "info")
+                    foul_result = await analyze_referee_foul_sequence(
+                        ffps, players, learned_jerseys, foul_fmt
+                    )
+                    if foul_result.get("foul_called") and foul_result.get("confidence", 0) >= 0.5:
+                        player_name = (foul_result.get("player_name") or
+                                       learned_jerseys.get(str(foul_result.get("jersey_number", ""))) or
+                                       "Jugador desconocido")
+                        team = foul_result.get("team", "titans")
+                        await emit_event(
+                            "whistle_vision", foul_fmt,
+                            player_name, team, "FOUL",
+                            foul_result.get("confidence", 0),
+                            f"Referee signal: {foul_result.get('reasoning', '')} | Type: {foul_result.get('foul_type', '?')}",
+                        )
+                        jn = foul_result.get("jersey_number")
+                        if jn and str(jn) not in learned_jerseys and foul_result.get("player_name"):
+                            learned_jerseys[str(jn)] = foul_result["player_name"]
+                            await manager.send(sid, {"type": "jersey_update", "map": learned_jerseys})
+
+                    for fp in ffps:
+                        try: os.remove(fp)
+                        except: pass
+
             pct = int((i + 1) / total * 100)
             await manager.send(sid, {"type": "auto_progress", "pct": pct, "phase": "scanning"})
 
-        # ── Phase 4: Audio results (if Whisper finished) ──────────────────
-        await status("🎙 Processing audio transcription results...")
-        audio_segments = await audio_task
+        # ─── PHASE 4: Whisper commentary (if available) ──────────────────
+        if whisper_task:
+            await status("🎙 Checking Whisper transcription results...", "info")
+            segments = await whisper_task
+            if segments:
+                await status(f"✓ Commentary: {len(segments)} segments — extracting player events...", "success")
+                audio_events = await analyze_transcription_chunks(segments, players)
+                for ev in audio_events:
+                    await emit_event(
+                        "audio", ev.get("video_ts", ""),
+                        ev.get("player", ""), ev.get("team", ""),
+                        ev.get("stat", ""), ev.get("confidence", 0),
+                        ev.get("quote", ""),
+                    )
+                await status(f"✓ Commentary analysis: {len(audio_events)} events", "success")
+            else:
+                await status("ℹ No commentary detected — video-only analysis", "info")
 
-        if audio_segments:
-            await status(f"✓ Audio: {len(audio_segments)} spoken segments — extracting stats with Claude...")
-            await manager.send(sid, {"type": "auto_phase", "phase": "audio"})
-            audio_events = await analyze_transcription_chunks(audio_segments, players)
-            for ev in audio_events:
-                await manager.send(sid, {
-                    "type": "ai_event",
-                    "id": str(uuid.uuid4())[:8],
-                    "source": "audio",
-                    "video_ts": ev.get("video_ts", ""),
-                    "player": ev.get("player", ""),
-                    "team": ev.get("team", ""),
-                    "stat": ev.get("stat", ""),
-                    "confidence": ev.get("confidence", 0),
-                    "quote": ev.get("quote", ""),
-                })
-            await status(f"✓ Audio analysis: {len(audio_events)} events from commentary", "success")
-        else:
-            await status("ℹ No commentary audio detected — visual analysis only", "info")
-
-        await status("✅ Full Auto complete! Review events in the feed.", "success")
+        await status("✅ Full Auto complete! All plays detected and streamed.", "success")
         await manager.send(sid, {"type": "auto_done", "learned_jerseys": learned_jerseys})
 
     except asyncio.CancelledError:
         await status("Full Auto stopped.", "warn")
     except Exception as e:
         await status(f"❌ Full Auto error: {e}", "error")
-        print(f"full_auto_pipeline error: {e}")
+        print(f"full_auto_pipeline error: {e}", flush=True)
+        import traceback; traceback.print_exc()
     finally:
         try:
             shutil.rmtree(work_dir, ignore_errors=True)

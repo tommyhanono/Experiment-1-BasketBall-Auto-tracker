@@ -415,3 +415,112 @@ async def transcribe_audio(url: str, work_dir: str, progress_cb=None) -> list[di
         await progress_cb(f"Transcription: {len(segments)} segments | {lang} {prob:.0%}")
 
     return segments
+
+
+def extract_audio_from_video(video_path: str, audio_path: str) -> bool:
+    """Extract mono audio from downloaded video file using ffmpeg. Returns True on success."""
+    try:
+        ffmpeg_bin, _ = _find_ffmpeg()
+    except RuntimeError:
+        return False
+    cmd = [ffmpeg_bin, "-y", "-i", video_path, "-ac", "1", "-ar", "22050",
+           "-q:a", "5", "-vn", audio_path]
+    result = subprocess.run(cmd, capture_output=True, timeout=300)
+    return result.returncode == 0 and os.path.exists(audio_path)
+
+
+def detect_whistle_timestamps(audio_path: str) -> list[dict]:
+    """
+    Detect referee whistle timestamps using bandpass FIR energy method.
+    Based on: 'Automated Referee Whistle Sound Detection for Extraction of Highlights
+    from Sports Video' — achieves 92.5% sensitivity.
+
+    Returns list of {"ts": float, "type": "whistle"|"cheer", "energy": float}.
+    """
+    import numpy as np
+
+    try:
+        ffmpeg_bin, _ = _find_ffmpeg()
+    except RuntimeError:
+        return []
+
+    # Decode audio to raw PCM float32 at 22050 Hz via ffmpeg pipe
+    cmd = [ffmpeg_bin, "-y", "-i", audio_path, "-ac", "1", "-ar", "22050",
+           "-f", "f32le", "-"]
+    result = subprocess.run(cmd, capture_output=True, timeout=600)
+    if result.returncode != 0 or not result.stdout:
+        return []
+
+    data = np.frombuffer(result.stdout, dtype=np.float32)
+    sr = 22050
+    duration = len(data) / sr
+
+    # ── Bandpass FIR filter (2800-4200 Hz) for whistle frequency range ──────
+    try:
+        from scipy.signal import firwin, lfilter
+        nyq = sr / 2
+        taps = firwin(65, [2800 / nyq, 4200 / nyq], pass_zero=False)
+        whistle_signal = lfilter(taps, 1.0, data)
+    except ImportError:
+        # Fallback: manual FFT bandpass using numpy
+        fft = np.fft.rfft(data)
+        freqs = np.fft.rfftfreq(len(data), 1 / sr)
+        mask = (freqs >= 2800) & (freqs <= 4200)
+        fft_filtered = fft * mask
+        whistle_signal = np.fft.irfft(fft_filtered, len(data))
+
+    # ── Full-band signal for crowd cheer detection ───────────────────────────
+    # Cheers = sustained broad-band high-energy bursts after scoring plays
+    full_signal = data
+
+    # ── Short-time energy (50ms window, 25ms hop) ───────────────────────────
+    win_samps = int(sr * 0.05)
+    hop_samps = int(sr * 0.025)
+
+    def ste(sig):
+        n = (len(sig) - win_samps) // hop_samps
+        return np.array([
+            np.sqrt(np.mean(sig[i * hop_samps: i * hop_samps + win_samps] ** 2))
+            for i in range(n)
+        ])
+
+    whistle_ste  = ste(whistle_signal)
+    full_ste     = ste(full_signal)
+    times = np.arange(len(whistle_ste)) * hop_samps / sr
+
+    # ── Decision thresholds ──────────────────────────────────────────────────
+    w_mean, w_std = whistle_ste.mean(), whistle_ste.std()
+    f_mean, f_std = full_ste.mean(), full_ste.std()
+
+    # Whistles: sharp spike in whistle band, duration < 1.5 seconds
+    whistle_thresh = w_mean + 3.0 * w_std
+    # Cheers: broad-band energy spike, duration > 2 seconds (crowd reacts to scores)
+    cheer_thresh   = f_mean + 2.5 * f_std
+
+    whistle_on = whistle_ste > whistle_thresh
+    cheer_on   = (full_ste > cheer_thresh) & (whistle_ste < whistle_thresh * 0.6)
+
+    def group_events(mask, min_gap_sec=1.5, min_dur_frames=2, max_dur_frames=60):
+        idxs = np.where(mask)[0]
+        if len(idxs) == 0:
+            return []
+        events, grp = [], [idxs[0]]
+        for idx in idxs[1:]:
+            if idx - grp[-1] < min_gap_sec / 0.025:
+                grp.append(idx)
+            else:
+                if min_dur_frames <= len(grp) <= max_dur_frames:
+                    events.append(times[int(np.median(grp))])
+                grp = [idx]
+        if min_dur_frames <= len(grp) <= max_dur_frames:
+            events.append(times[int(np.median(grp))])
+        return events
+
+    whistle_events = group_events(whistle_on, min_gap_sec=1.5, min_dur_frames=2, max_dur_frames=30)
+    cheer_events   = group_events(cheer_on,   min_gap_sec=2.0, min_dur_frames=6, max_dur_frames=200)
+
+    results = [{"ts": t, "type": "whistle"} for t in whistle_events]
+    results += [{"ts": t, "type": "cheer"}  for t in cheer_events]
+    results.sort(key=lambda x: x["ts"])
+
+    return results

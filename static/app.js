@@ -542,11 +542,20 @@ function buildEventCard(data) {
   const confClass = conf >= 0.8 ? 'high' : conf >= 0.6 ? 'med' : 'low';
   const confPct = Math.round(conf * 100);
 
+  // Source badge styling
+  const sourceBadge = {
+    'whistle_vision': '🚨 Whistle',
+    'audio':          '🎙 Audio',
+    'full_auto':      '🤖 Vision',
+  }[data.source] || '🤖 AI';
+
+  const isFoul = data.stat === 'FOUL';
+
   card.innerHTML = `
-    <span class="event-source ai">🤖 AI</span>
+    <span class="event-source ${data.source === 'whistle_vision' ? 'whistle' : 'ai'}">${sourceBadge}</span>
     <span class="event-ts">${data.video_ts || ''}</span>
     <div class="event-body">
-      <span class="event-player ${isRival ? 'event-rival' : ''}">${playerName}</span>
+      <span class="event-player ${isRival ? 'event-rival' : ''} ${isFoul ? 'event-foul' : ''}">${playerName}</span>
       <span class="event-stat"> — ${statLabel}</span>
       ${data.quote ? `<div class="event-quote">"${data.quote}"</div>` : ''}
     </div>
@@ -695,6 +704,40 @@ function handleServerMsg(msg) {
     case 'score_update':
       applyScoreUpdate(msg);
       break;
+    case 'whistle_events':
+      // Pre-analysis results from audio whistle detection
+      setStatus(`🎵 Audio: ${msg.count} whistles + ${msg.cheer_count} crowd cheers ready for analysis`, 'info');
+      break;
+    case 'timeout_stats': {
+      // Broadcast stat overlay found during timeout/halftime
+      const pstats = msg.player_stats || {};
+      const label = msg.is_halftime ? '🏁 Halftime stats' : '⏸ Timeout stats';
+      setStatus(`${label} @${msg.video_ts} — ${Object.keys(pstats).length} player(s) detected`, 'success');
+      // Auto-apply accumulated cumulative stats visible in the overlay
+      let applied = 0;
+      Object.entries(pstats).forEach(([playerName, stats]) => {
+        const matched = S.players.find(p => p.toLowerCase().includes(playerName.toLowerCase()) ||
+                                           playerName.toLowerCase().includes(p.split(' ')[0].toLowerCase()));
+        if (!matched) return;
+        if (!S.stats[matched]) S.stats[matched] = {};
+        const statMap = { PTS: null, REB: 'REB_DEF', AST: 'AST', STL: 'STL', BLK: 'BLK', FOUL: 'FOUL' };
+        Object.entries(stats || {}).forEach(([k, v]) => {
+          if (v != null && statMap[k]) {
+            const sk = statMap[k];
+            if (sk && (S.stats[matched][sk] || 0) < v) {
+              S.stats[matched][sk] = v;
+              applied++;
+            }
+          }
+        });
+      });
+      if (applied > 0) {
+        saveState();
+        renderStats();
+        toast(`📊 ${label}: ${applied} stat(s) synced from broadcast overlay!`);
+      }
+      break;
+    }
     case 'error':
       setStatus(`❌ ${msg.msg}`, 'error');
       break;

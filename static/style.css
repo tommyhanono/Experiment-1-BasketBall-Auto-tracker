@@ -141,6 +141,8 @@ html, body { height: 100%; font-family: 'Helvetica Neue', Arial, sans-serif; bac
 .event-source { font-size: 0.7rem; font-weight: 700; padding: 1px 5px; border-radius: 3px; background: rgba(255,255,255,0.1); white-space: nowrap; flex-shrink: 0; }
 .event-source.ai { background: rgba(241,196,15,0.2); color: var(--gold); }
 .event-source.manual { background: rgba(46,204,113,0.2); color: #2ecc71; }
+.event-source.whistle { background: rgba(231,76,60,0.25); color: #e74c3c; }
+.event-foul { color: #e74c3c; font-weight: 700; }
 .event-ts { color: var(--text2); font-size: 0.72rem; flex-shrink: 0; }
 .event-body { flex: 1; }
 .event-player { font-weight: 700; }
