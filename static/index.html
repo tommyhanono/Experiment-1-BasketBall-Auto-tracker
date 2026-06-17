@@ -117,6 +117,34 @@
   </section>
 </main>
 
+<!-- QUICK STATS LIVE PANEL -->
+<section class="quickstats-section" id="quickStatsPanel">
+  <div class="qs-header">
+    <span class="qs-title">⚡ Quick Stats</span>
+    <span class="qs-hint">Tap a player → then tap the stat you saw</span>
+    <button class="btn-sm qs-toggle" id="btnToggleQS">Hide</button>
+  </div>
+  <div class="qs-body">
+    <div class="qs-players" id="qsPlayers"><!-- rendered by JS --></div>
+    <div class="qs-stats" id="qsStats">
+      <button class="qs-stat-btn" data-stat="REB_OFF">🔄 Reb. Of</button>
+      <button class="qs-stat-btn" data-stat="REB_DEF">🛡 Reb. Def</button>
+      <button class="qs-stat-btn" data-stat="AST">🎯 Asist</button>
+      <button class="qs-stat-btn" data-stat="TOV">💸 Pérdida</button>
+      <button class="qs-stat-btn" data-stat="STL">✂️ Robo</button>
+      <button class="qs-stat-btn" data-stat="BLK">🚫 Bloqueo</button>
+      <button class="qs-stat-btn foul" data-stat="FOUL">🚨 Falta</button>
+      <button class="qs-stat-btn shot2" data-stat="2PT_MADE">✓ 2PT</button>
+      <button class="qs-stat-btn shot3" data-stat="3PT_MADE">✓ 3PT</button>
+      <button class="qs-stat-btn ft" data-stat="FT_MADE">✓ TL</button>
+      <button class="qs-stat-btn miss" data-stat="2PT_MISS">✗ 2PT</button>
+      <button class="qs-stat-btn miss" data-stat="3PT_MISS">✗ 3PT</button>
+      <button class="qs-stat-btn miss" data-stat="FT_MISS">✗ TL</button>
+    </div>
+    <div class="qs-selected" id="qsSelected">← Select a player first</div>
+  </div>
+</section>
+
 <!-- AI EVENT FEED -->
 <section class="feed-section">
   <div class="feed-header">

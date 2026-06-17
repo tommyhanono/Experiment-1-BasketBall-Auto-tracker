@@ -494,6 +494,79 @@ Return ONLY valid JSON:
     return {"jersey_map_updates": {}, "descriptions": {}}
 
 
+async def detect_substitution(frame_paths: list[str], players: list[str], jersey_map: dict, on_court: list[str]) -> dict:
+    """
+    Detect player substitutions at a dead-ball moment.
+    In Copa Talento, subs happen at the scorer's table (near the camera).
+    Returns {"sub_in": "player_name", "sub_out": "player_name", "jersey_in": "7", "jersey_out": "12"}
+    """
+    if not frame_paths:
+        return {}
+
+    roster_str = "\n".join(f"  #{next((n for n,nm in jersey_map.items() if nm==p), '?')} — {p}" for p in players)
+    on_court_str = ", ".join(on_court) if on_court else "unknown"
+
+    prompt = f"""You are watching frames from a basketball broadcast during a DEAD BALL (whistle blown, clock stopped).
+
+A SUBSTITUTION may be happening. In Copa Talento broadcasts:
+- Substitutions happen at the SCORER'S TABLE (bottom edge of frame, nearest camera)
+- The outgoing player walks TOWARD the table (toward the camera, getting larger)
+- The incoming player stands at the table waiting, then runs ONTO the court
+- This is the BEST moment to read jersey numbers (players are close to camera)
+
+Titans roster with known jersey numbers:
+{roster_str}
+
+Players currently on court (according to our records): {on_court_str}
+
+LOOK FOR:
+1. A player walking toward the bottom of the frame (toward scorer's table)
+2. A player standing at the sideline ready to enter
+3. ANY jersey numbers visible on players near the bottom of the frame
+4. The new player running onto court in later frames
+
+Return ONLY valid JSON:
+{{
+  "substitution_detected": true or false,
+  "sub_out": null or "player name from roster",
+  "sub_in": null or "player name from roster",
+  "jersey_out": null or "jersey number string",
+  "jersey_in": null or "jersey number string",
+  "confidence": 0.0 to 1.0,
+  "jerseys_seen_near_table": {{}},
+  "reasoning": "what you saw"
+}}"""
+
+    try:
+        content = []
+        for path in frame_paths:
+            # Use high resolution + bottom crop (scorer's table area)
+            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                             "data": _encode_frame(path, max_dim=720)}})
+        # Add a zoomed crop of the bottom 25% where the scorer's table is
+        bottom_crop = _crop_and_encode(frame_paths[-1], (0.0, 0.75, 1.0, 1.0), zoom=3.0)
+        content.append({"type": "text", "text": "=== ZOOMED SCORER'S TABLE AREA ==="})
+        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": bottom_crop}})
+        content.append({"type": "text", "text": prompt})
+
+        def _call():
+            return get_client().messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=400,
+                messages=[{"role": "user", "content": content}]
+            ).content[0].text
+
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(None, _call)
+        raw = re.sub(r"```(?:json)?\s*", "", raw.strip()).strip()
+        s, e = raw.find('{'), raw.rfind('}')
+        if s != -1 and e != -1:
+            return json.loads(raw[s:e+1])
+    except Exception as err:
+        print(f"substitution detect error: {err}")
+    return {}
+
+
 async def detect_team_jersey_colors(frame_path: str) -> dict:
     """
     Detect the jersey colors of each team from a frame.

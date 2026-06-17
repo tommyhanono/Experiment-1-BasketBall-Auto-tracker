@@ -201,6 +201,31 @@ html, body { height: 100%; font-family: 'Helvetica Neue', Arial, sans-serif; bac
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 .hidden { display: none !important; }
 
+/* ── Quick Stats Panel ── */
+.quickstats-section { background: var(--navy2); border-top: 2px solid var(--gold); padding: 10px 16px; }
+.qs-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.qs-title { font-size: 0.85rem; font-weight: 700; color: var(--gold); }
+.qs-hint { font-size: 0.72rem; color: var(--text2); flex: 1; }
+.qs-toggle { margin-left: auto; }
+.qs-body { display: flex; flex-direction: column; gap: 8px; }
+.qs-players { display: flex; flex-wrap: wrap; gap: 5px; }
+.qs-player-btn { background: rgba(255,255,255,0.06); border: 1px solid var(--border); color: var(--text2); border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 0.76rem; font-weight: 600; transition: all 0.15s; }
+.qs-player-btn:hover { background: rgba(255,255,255,0.12); color: var(--text); }
+.qs-player-btn.selected { background: var(--gold); color: #000; border-color: var(--gold); }
+.qs-player-btn.on-court { border-color: rgba(46,204,113,0.5); }
+.qs-player-btn.on-court.selected { background: var(--gold); }
+.qs-stats { display: flex; flex-wrap: wrap; gap: 5px; }
+.qs-stat-btn { background: rgba(255,255,255,0.07); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 0.78rem; font-weight: 600; transition: all 0.1s; }
+.qs-stat-btn:hover { background: rgba(255,255,255,0.15); transform: scale(1.05); }
+.qs-stat-btn.foul { color: #e74c3c; border-color: rgba(231,76,60,0.4); }
+.qs-stat-btn.shot2 { color: #2ecc71; border-color: rgba(46,204,113,0.4); }
+.qs-stat-btn.shot3 { color: #27ae60; border-color: rgba(39,174,96,0.4); }
+.qs-stat-btn.ft { color: #1abc9c; border-color: rgba(26,188,156,0.4); }
+.qs-stat-btn.miss { color: var(--accent); border-color: rgba(231,76,60,0.3); }
+.qs-stat-btn.tapped { animation: tapFlash 0.25s ease; }
+@keyframes tapFlash { 0%{transform:scale(1)} 50%{transform:scale(0.92);background:rgba(241,196,15,0.3)} 100%{transform:scale(1)} }
+.qs-selected { font-size: 0.75rem; color: var(--gold); padding: 4px 0; min-height: 1.2rem; }
+
 /* ── AI Setup Panel ── */
 .ai-setup-panel { margin-top: 10px; padding: 10px 12px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; }
 .ai-setup-panel .section-label { margin-bottom: 8px; }

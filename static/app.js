@@ -704,8 +704,34 @@ function handleServerMsg(msg) {
     case 'score_update':
       applyScoreUpdate(msg);
       break;
+    case 'substitution': {
+      const inP  = msg.sub_in  || '?';
+      const outP = msg.sub_out || '?';
+      setStatus(`🔄 Sustitución @${msg.video_ts}: ${outP} sale → ${inP} entra`, 'info');
+      // Update on-court status in state
+      if (msg.sub_out && S.players.includes(msg.sub_out)) {
+        const idx = S.onCourt.indexOf(msg.sub_out);
+        if (idx !== -1) S.onCourt.splice(idx, 1);
+      }
+      if (msg.sub_in && S.players.includes(msg.sub_in) && !S.onCourt.includes(msg.sub_in)) {
+        S.onCourt.push(msg.sub_in);
+      }
+      renderPlayers();
+      saveState();
+      break;
+    }
+    case 'minutes_update': {
+      const mins = msg.minutes || {};
+      Object.entries(mins).forEach(([player, m]) => {
+        if (!S.stats[player]) return;
+        if (m > (S.stats[player].MIN || 0)) {
+          S.stats[player].MIN = m;
+        }
+      });
+      updateTableRow && S.players.forEach(p => updateTableRow(p));
+      break;
+    }
     case 'whistle_events':
-      // Pre-analysis results from audio whistle detection
       setStatus(`🎵 Audio: ${msg.count} whistles + ${msg.cheer_count} crowd cheers ready for analysis`, 'info');
       break;
     case 'timeout_stats': {
@@ -1107,6 +1133,92 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btnAdd').addEventListener('click', addPlayer);
   document.getElementById('btnRemove').addEventListener('click', removePlayer);
   document.getElementById('btnConfirmAll').addEventListener('click', confirmAllHighConfidence);
+
+  // ── Quick Stats Panel ─────────────────────────────────────────────────────
+  let qsSelectedPlayer = null;
+
+  function renderQsPlayers() {
+    const container = document.getElementById('qsPlayers');
+    if (!container) return;
+    container.innerHTML = '';
+    S.players.forEach(p => {
+      const btn = document.createElement('button');
+      btn.className = 'qs-player-btn' + (p === qsSelectedPlayer ? ' selected' : '') + (S.onCourt.includes(p) ? ' on-court' : '');
+      btn.textContent = shortName(p);
+      btn.addEventListener('click', () => {
+        qsSelectedPlayer = (qsSelectedPlayer === p) ? null : p;
+        document.getElementById('qsSelected').textContent =
+          qsSelectedPlayer ? `✓ ${qsSelectedPlayer} — tap a stat` : '← Select a player first';
+        renderQsPlayers();
+      });
+      container.appendChild(btn);
+    });
+  }
+
+  function logQuickStat(player, stat) {
+    if (!player || !S.players.includes(player)) { toast('Select a player first'); return; }
+    // Push to history for undo
+    S.history.push({ player, key: stat, prev: { ...S.stats[player] } });
+    applyStatKey(player, stat);
+    if (stat === 'FOUL') checkFoulOut(player);
+    updateCounts();
+    updateScores();
+    updateTableRow(player);
+    save();
+
+    // Add to event feed as a manual event
+    const id = crypto.randomUUID().slice(0, 8);
+    const feedEv = {
+      id, source: 'manual', video_ts: currentVideoTs(),
+      player, team: 'titans', stat, confidence: 1.0,
+      quote: 'Manual quick stat', _confirmed: true,
+    };
+    aiEvents.push(feedEv);
+    eventCount++;
+    document.getElementById('feedCounter').textContent = `${eventCount} event${eventCount !== 1 ? 's' : ''} detected`;
+    const feed = document.getElementById('eventFeed');
+    const empty = feed.querySelector('.feed-empty');
+    if (empty) empty.remove();
+    const card = buildEventCard(feedEv);
+    card.className = 'event-card confirmed';
+    card.querySelector('.event-actions').innerHTML = '<span style="color:#2ecc71;font-size:0.78rem">✓ Manual</span>';
+    feed.insertBefore(card, feed.firstChild);
+
+    toast(`✓ ${shortName(player)} — ${STAT_LABELS[stat] || stat}`);
+
+    // Visual feedback on the stat button
+    const statBtn = document.querySelector(`.qs-stat-btn[data-stat="${CSS.escape(stat)}"]`);
+    if (statBtn) {
+      statBtn.classList.add('tapped');
+      statBtn.addEventListener('animationend', () => statBtn.classList.remove('tapped'), { once: true });
+    }
+  }
+
+  function currentVideoTs() {
+    // Try to read current clock from scoreboard display
+    const clock = document.getElementById('clockDisplay')?.textContent || '';
+    const quarter = document.getElementById('quarterDisplay')?.textContent || '';
+    return quarter && clock ? `${quarter} ${clock}` : new Date().toLocaleTimeString();
+  }
+
+  document.querySelectorAll('.qs-stat-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (!qsSelectedPlayer) { toast('Select a player first ↑'); return; }
+      logQuickStat(qsSelectedPlayer, btn.dataset.stat);
+    });
+  });
+
+  document.getElementById('btnToggleQS')?.addEventListener('click', () => {
+    const body = document.querySelector('.qs-body');
+    const btn = document.getElementById('btnToggleQS');
+    if (body.classList.toggle('hidden')) { btn.textContent = 'Show'; }
+    else { btn.textContent = 'Hide'; }
+  });
+
+  // Re-render QS players whenever roster changes
+  const _origRenderPlayers = renderPlayers;
+  renderPlayers = function() { _origRenderPlayers(); renderQsPlayers(); };
+  renderQsPlayers();
 
   document.getElementById('btnToggleTable').addEventListener('click', () => {
     const sec = document.getElementById('tableSection');

@@ -19,7 +19,7 @@ from claude_analyzer import (
     quick_score_check, analyze_transcription_chunks,
     analyze_referee_foul_sequence, analyze_timeout_screen,
     extract_jersey_numbers_ocr, scan_frame_for_jerseys,
-    detect_team_jersey_colors,
+    detect_team_jersey_colors, detect_substitution,
 )
 
 app = FastAPI(title="Titans Basketball Auto Tracker")
@@ -644,7 +644,11 @@ async def full_auto_pipeline(
     analyzed_whistles    = set()
     titans_color         = titans_jersey_color
     rival_color          = rival_jersey_color
-    quarter_break_scanned = set()  # quarters we've already scanned for stat screens
+    quarter_break_scanned = set()
+    # Minutes tracking: {player_name: [{"in": ts_sec, "out": ts_sec|None}]}
+    on_court_log         = {}   # who is currently on court (detected)
+    on_court_since       = {}   # {player: timestamp_seconds}
+    total_minutes        = {}   # {player: total_seconds_played}
 
     async def status(msg, level="info"):
         await manager.send(sid, {"type": "status", "msg": msg, "level": level})
@@ -927,6 +931,47 @@ async def full_auto_pipeline(
                             learned_jerseys[str(jn)] = foul_result["player_name"]
                             await manager.send(sid, {"type": "jersey_update", "map": learned_jerseys})
 
+                    # ── Substitution detection at this whistle ────────────
+                    current_on_court = list(on_court_log.keys())
+                    sub_result = await detect_substitution(ffps, players, learned_jerseys, current_on_court)
+                    if sub_result.get("substitution_detected") and sub_result.get("confidence", 0) >= 0.55:
+                        sub_in  = sub_result.get("sub_in")
+                        sub_out = sub_result.get("sub_out")
+                        jn_in   = str(sub_result.get("jersey_in", "") or "")
+                        jn_out  = str(sub_result.get("jersey_out", "") or "")
+
+                        # Update jersey map from sub frames (best jersey-read opportunity)
+                        for jn, pname in [(jn_in, sub_in), (jn_out, sub_out)]:
+                            if jn and pname and pname in players and jn not in learned_jerseys:
+                                learned_jerseys[jn] = pname
+                                await manager.send(sid, {"type": "jersey_update", "map": learned_jerseys})
+
+                        # Track minutes: record sub_out leaving, sub_in entering
+                        if sub_out and sub_out in on_court_log:
+                            secs_played = whistle_ts - on_court_since.get(sub_out, 0)
+                            total_minutes[sub_out] = total_minutes.get(sub_out, 0) + secs_played
+                            del on_court_log[sub_out]
+                            del on_court_since[sub_out]
+                        if sub_in and sub_in in players:
+                            on_court_log[sub_in]  = True
+                            on_court_since[sub_in] = whistle_ts
+
+                        await manager.send(sid, {
+                            "type": "substitution",
+                            "video_ts": foul_fmt,
+                            "sub_in":   sub_in,
+                            "sub_out":  sub_out,
+                            "jersey_in":  jn_in,
+                            "jersey_out": jn_out,
+                            "confidence": sub_result.get("confidence", 0),
+                        })
+                        if sub_in or sub_out:
+                            await status(f"🔄 Sub @{foul_fmt}: {sub_out or '?'} OUT → {sub_in or '?'} IN", "info")
+
+                        # Also update minutes totals and emit to frontend
+                        mins_update = {p: round(total_minutes.get(p, 0) / 60, 1) for p in players}
+                        await manager.send(sid, {"type": "minutes_update", "minutes": mins_update})
+
                     for fp in ffps:
                         try: os.remove(fp)
                         except: pass
@@ -952,8 +997,14 @@ async def full_auto_pipeline(
             else:
                 await status("ℹ No commentary detected — video-only analysis", "info")
 
+        # ── Finalize minutes for players still on court at game end ───────
+        for p, since in on_court_since.items():
+            total_minutes[p] = total_minutes.get(p, 0) + (duration - since)
+        final_mins = {p: round(total_minutes.get(p, 0) / 60, 1) for p in players}
+        await manager.send(sid, {"type": "minutes_update", "minutes": final_mins})
+
         await status("✅ Full Auto complete! All plays detected and streamed.", "success")
-        await manager.send(sid, {"type": "auto_done", "learned_jerseys": learned_jerseys})
+        await manager.send(sid, {"type": "auto_done", "learned_jerseys": learned_jerseys, "minutes": final_mins})
 
     except asyncio.CancelledError:
         await status("Full Auto stopped.", "warn")
