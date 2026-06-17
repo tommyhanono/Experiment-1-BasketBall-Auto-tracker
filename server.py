@@ -18,7 +18,8 @@ from claude_analyzer import (
     analyze_chunk, analyze_frame_for_stats, analyze_play_sequence,
     quick_score_check, analyze_transcription_chunks,
     analyze_referee_foul_sequence, analyze_timeout_screen,
-    extract_jersey_numbers_ocr,
+    extract_jersey_numbers_ocr, scan_frame_for_jerseys,
+    detect_team_jersey_colors,
 )
 
 app = FastAPI(title="Titans Basketball Auto Tracker")
@@ -85,7 +86,10 @@ class FullAutoReq(BaseModel):
     session_id: str
     players: list[str]
     jersey_map: dict = {}
-    score_interval: int = 5    # seconds between local score checks
+    score_interval: int = 3     # seconds between local score checks (3 = tight window)
+    player_profiles: dict = {}  # {"Joseph Gabay": "short guard, shoots 3PT from right wing"}
+    titans_jersey_color: str = "gray/white"
+    rival_jersey_color: str = "colored"
 
 
 @app.get("/")
@@ -584,7 +588,11 @@ async def full_auto(req: FullAutoReq):
     if key in active_tasks:
         active_tasks[key].cancel()
     task = asyncio.create_task(
-        full_auto_pipeline(req.url, req.session_id, req.players, req.jersey_map, req.score_interval)
+        full_auto_pipeline(
+            req.url, req.session_id, req.players, req.jersey_map,
+            req.score_interval, req.player_profiles,
+            req.titans_jersey_color, req.rival_jersey_color,
+        )
     )
     active_tasks[key] = task
     return {"status": "started"}
@@ -602,14 +610,23 @@ async def _send(sid, **kwargs):
     await manager.send(sid, kwargs)
 
 
-async def full_auto_pipeline(url: str, sid: str, players: list[str], jersey_map: dict, score_interval: int):
+async def full_auto_pipeline(
+    url: str,
+    sid: str,
+    players: list[str],
+    jersey_map: dict,
+    score_interval: int = 3,
+    player_profiles: dict | None = None,
+    titans_jersey_color: str = "gray/white",
+    rival_jersey_color: str = "colored",
+):
     """
-    4-source fully automatic pipeline:
-    1. Whistle detection (FIR bandpass 2800-4200 Hz, 92.5% sensitivity) → foul timestamps
-    2. Score change detection (local frames, every 5s) → scoring play analysis via Claude Vision
-    3. EasyOCR on every play frame → jersey number extraction (FREE, no API)
-    4. Timeout stat screens → complete player stats overlay reading
-    All four sources merged and streamed via WebSocket in real-time.
+    5-phase Copa Talento pipeline — works 100% without audio commentary.
+    Phase 0: Warmup scan (first 10 min, close-up shots → build jersey map)
+    Phase 1: Jersey color detection from first readable frame
+    Phase 2: Audio whistle detection (referee whistles from ambient gym sound)
+    Phase 3: Scoreboard scan every 3s → play analysis with crop+zoom + color ID
+    Phase 4: Quarter-break stat screen scanning (between Q1/Q2/Q3/Q4)
     """
     import shutil
 
@@ -617,12 +634,17 @@ async def full_auto_pipeline(url: str, sid: str, players: list[str], jersey_map:
     os.makedirs(work_dir, exist_ok=True)
     video_path  = os.path.join(work_dir, "game.mp4")
     audio_path  = os.path.join(work_dir, "game_audio.mp3")
-    learned_jerseys  = dict(jersey_map)
+    learned_jerseys      = dict(jersey_map)
+    player_profiles      = player_profiles or {}
     last_score           = {"titans": None, "rival": None}
+    last_quarter         = None
     last_clock           = None
     clock_same_count     = 0
     timeout_frames_analyzed = set()
-    analyzed_whistles    = set()   # prevent duplicate foul analysis per whistle
+    analyzed_whistles    = set()
+    titans_color         = titans_jersey_color
+    rival_color          = rival_jersey_color
+    quarter_break_scanned = set()  # quarters we've already scanned for stat screens
 
     async def status(msg, level="info"):
         await manager.send(sid, {"type": "status", "msg": msg, "level": level})
@@ -643,7 +665,7 @@ async def full_auto_pipeline(url: str, sid: str, players: list[str], jersey_map:
         })
 
     try:
-        # ─── PHASE 1: Download video ───────────────────────────────────────
+        # ─── PHASE 0: Download video ───────────────────────────────────────
         await status("⬇ Downloading game video (this takes a few minutes)...")
         await manager.send(sid, {"type": "auto_phase", "phase": "download"})
 
@@ -658,37 +680,68 @@ async def full_auto_pipeline(url: str, sid: str, players: list[str], jersey_map:
             await status("❌ Could not read video duration.", "error")
             return
 
-        size_mb = os.path.getsize(video_path) // 1048576
-        await status(f"✓ Video downloaded ({size_mb}MB, {duration//60}m {duration%60}s). Starting analysis...")
-
-        # ─── PHASE 2: Audio whistle detection (parallel) ──────────────────
-        await status("🎵 Extracting audio for whistle detection...")
         loop = asyncio.get_event_loop()
+        size_mb = os.path.getsize(video_path) // 1048576
+        await status(f"✓ Video downloaded ({size_mb}MB, {duration//60}m {duration%60}s)")
 
+        # ─── PHASE 1: Detect jersey colors from first readable frame ──────
+        first_frame = os.path.join(work_dir, "first_frame.jpg")
+        ok = await loop.run_in_executor(None, extract_frame_local, video_path, 90, first_frame)
+        if ok and not jersey_map:
+            await status("🎨 Detecting team jersey colors...")
+            colors = await detect_team_jersey_colors(first_frame)
+            if colors.get("titans_color"):
+                titans_color = colors["titans_color"]
+                rival_color  = colors.get("rival_color", rival_color)
+                rival_name   = colors.get("rival_name", "")
+                await status(f"✓ Titans = {titans_color} jerseys | {rival_name or 'Rival'} = {rival_color}")
+
+        # ─── PHASE 2: Warmup scan (first 10 min → jersey number extraction) ──
+        warmup_end = min(600, duration // 2)
+        if warmup_end > 60 and not all(n in learned_jerseys for n in [str(i) for i in range(1, 30)]):
+            await status(f"🔍 Warmup scan: scanning first {warmup_end//60}m for jersey numbers...")
+            await manager.send(sid, {"type": "auto_phase", "phase": "warmup"})
+            warmup_timestamps = list(range(30, warmup_end, 30))
+            warmup_frame = os.path.join(work_dir, "warmup_frame.jpg")
+            jerseys_found_warmup = 0
+            for wt in warmup_timestamps:
+                if f"auto_{sid}" not in active_tasks:
+                    break
+                ok = await loop.run_in_executor(None, extract_frame_local, video_path, wt, warmup_frame)
+                if ok:
+                    result = await scan_frame_for_jerseys(warmup_frame, players, learned_jerseys)
+                    updates = result.get("jersey_map_updates", {})
+                    if updates:
+                        new_found = {k: v for k, v in updates.items() if k not in learned_jerseys}
+                        if new_found:
+                            learned_jerseys.update(new_found)
+                            jerseys_found_warmup += len(new_found)
+                            for num, name in new_found.items():
+                                await status(f"✓ Warmup: found #{num} = {name}", "success")
+                            await manager.send(sid, {"type": "jersey_update", "map": learned_jerseys})
+                # Small delay to avoid hammering API
+                await asyncio.sleep(0.2)
+            await status(f"✓ Warmup scan done — {jerseys_found_warmup} new jersey numbers found")
+
+        # ─── PHASE 3: Audio whistle detection ────────────────────────────
+        await status("🎵 Extracting audio for whistle/foul detection...")
         audio_ok = await loop.run_in_executor(None, extract_audio_from_video, video_path, audio_path)
 
         whistle_events = []
         whisper_task = None
         if audio_ok:
-            # Run both whistle detection and Whisper transcription in parallel
             whistle_events = await loop.run_in_executor(None, detect_whistle_timestamps, audio_path)
             w_count = sum(1 for e in whistle_events if e["type"] == "whistle")
             c_count = sum(1 for e in whistle_events if e["type"] == "cheer")
-            await status(f"🎵 Audio events: {w_count} whistles + {c_count} crowd cheers detected")
+            await status(f"🎵 Audio: {w_count} referee whistles + {c_count} crowd cheers indexed")
             await manager.send(sid, {"type": "whistle_events", "count": w_count, "cheer_count": c_count})
-
-            # Start Whisper in background (for videos WITH commentary)
-            whisper_task = asyncio.create_task(
-                transcribe_audio(url, work_dir)
-            )
+            whisper_task = asyncio.create_task(transcribe_audio(url, work_dir))
         else:
             await status("⚠ Could not extract audio — visual analysis only", "warn")
 
-        # ─── PHASE 3: Scoreboard scan + score change play analysis ─────────
-        await status(f"🔍 Scanning {duration//60}m game — every {score_interval}s...")
+        # ─── PHASE 4: Scoreboard scan every score_interval seconds ───────
+        await status(f"📡 Main scan: every {score_interval}s for {duration//60}m...")
         await manager.send(sid, {"type": "auto_phase", "phase": "scanning"})
-
-        # Index whistle events by timestamp for O(1) lookup
         whistle_set = {int(e["ts"]): e["type"] for e in whistle_events}
 
         timestamps = list(range(60, min(duration, 7200), score_interval))
@@ -718,16 +771,41 @@ async def full_auto_pipeline(url: str, sid: str, players: list[str], jersey_map:
                     "video_ts": f"{ts//60}:{ts%60:02d}",
                 })
 
-            # ── Timeout detection (clock unchanged for 30+ seconds) ────────
+            # ── Quarter change → scan for stats screen ────────────────────
+            if cur_q and cur_q != last_quarter and last_quarter is not None:
+                qkey = f"{last_quarter}→{cur_q}"
+                if qkey not in quarter_break_scanned:
+                    quarter_break_scanned.add(qkey)
+                    await status(f"🏁 Quarter break: {last_quarter} → {cur_q} — scanning for stats screen...", "info")
+                    qb_frame = os.path.join(work_dir, "qbreak_frame.jpg")
+                    # Scan 8 frames over the 30 seconds BEFORE the quarter change
+                    for qts in range(max(0, ts - 30), ts + 10, 5):
+                        ok_q = await loop.run_in_executor(None, extract_frame_local, video_path, qts, qb_frame)
+                        if ok_q:
+                            screen = await analyze_timeout_screen(qb_frame, players)
+                            if screen.get("has_stats") and screen.get("player_stats"):
+                                pstats = screen["player_stats"]
+                                label = "🏁 Halftime stats" if "2" in str(last_quarter) else f"📊 Q{last_quarter} break stats"
+                                await status(f"{label} found — {len(pstats)} players!", "success")
+                                await manager.send(sid, {
+                                    "type": "timeout_stats",
+                                    "video_ts": f"{ts//60}:{ts%60:02d}",
+                                    "player_stats": pstats,
+                                    "is_halftime": "2" in str(last_quarter),
+                                })
+                                break
+            last_quarter = cur_q or last_quarter
+
+            # ── Timeout detection (clock unchanged for ~30s) ──────────────
             if cur_clock and cur_clock == last_clock:
                 clock_same_count += 1
-                if clock_same_count == 6 and ts not in timeout_frames_analyzed:  # ~30s unchanged
+                if clock_same_count == 10 and ts not in timeout_frames_analyzed:
                     timeout_frames_analyzed.add(ts)
-                    await status(f"⏸ Timeout/stoppage @{ts//60}:{ts%60:02d} — checking for stats overlay...", "info")
+                    await status(f"⏸ Stoppage @{ts//60}:{ts%60:02d} — checking stats overlay...", "info")
                     screen = await analyze_timeout_screen(frame_path, players)
                     if screen.get("has_stats") and screen.get("player_stats"):
                         pstats = screen["player_stats"]
-                        await status(f"📊 Stats screen found! {len(pstats)} player(s) visible", "success")
+                        await status(f"📊 Stats screen found! {len(pstats)} players", "success")
                         await manager.send(sid, {
                             "type": "timeout_stats",
                             "video_ts": f"{ts//60}:{ts%60:02d}",
@@ -750,50 +828,45 @@ async def full_auto_pipeline(url: str, sid: str, players: list[str], jersey_map:
             if cur_r is not None: last_score["rival"]  = cur_r
 
             if titans_delta > 0 or rival_delta > 0:
-                play_ts  = max(60, ts - score_interval)
+                play_ts  = max(60, ts - score_interval * 2)
                 play_fmt = f"{play_ts//60}:{play_ts%60:02d}"
-                await status(f"⚡ Score change @{play_fmt}: Titans+{titans_delta} Rival+{rival_delta} — analyzing...")
+                await status(f"⚡ @{play_fmt}: Titans+{titans_delta} Rival+{rival_delta} — analyzing play...")
 
-                # Extract 6 frames from play window (local, instant)
-                play_tss = [play_ts + int(j * score_interval / 5) for j in range(6)]
+                # ── Extract 8 frames from the play window ─────────────────
+                play_tss = [play_ts + int(j * (score_interval * 2) / 7) for j in range(8)]
                 play_frames_data = await loop.run_in_executor(
                     None, extract_frames_local_batch, video_path, play_tss, work_dir
                 )
                 fps = [p for _, p in play_frames_data]
 
                 if fps:
-                    # ── EasyOCR jersey pass (free, fast) ──────────────────
+                    # ── EasyOCR pass (no-cost jersey OCR) ─────────────────
                     ocr_numbers = []
                     for fp in fps:
                         ocr_numbers.extend(extract_jersey_numbers_ocr(fp))
-                    if ocr_numbers:
-                        best = max(ocr_numbers, key=lambda x: x["confidence"])
-                        num = best["number"]
-                        if num not in learned_jerseys and titans_delta > 0:
-                            await manager.send(sid, {
-                                "type": "status",
-                                "msg": f"🔢 OCR found #{num} in play frame (conf={best['confidence']:.0%})",
-                                "level": "info",
-                            })
 
-                    # ── Claude Vision play analysis ────────────────────────
+                    # ── Copa Talento Vision analysis with crop+zoom ────────
                     score_before = {"titans": (cur_t or 0) - titans_delta, "rival": (cur_r or 0) - rival_delta}
                     score_after  = {"titans": cur_t or 0, "rival": cur_r or 0}
                     events, new_jerseys, play_desc = await analyze_play_sequence(
-                        fps, players, learned_jerseys, score_before, score_after, play_fmt
+                        fps, players, learned_jerseys, score_before, score_after, play_fmt,
+                        player_profiles=player_profiles,
+                        titans_jersey_color=titans_color,
+                        rival_jersey_color=rival_color,
                     )
 
                     if new_jerseys:
                         learned_jerseys.update(new_jerseys)
                         await manager.send(sid, {"type": "jersey_update", "map": learned_jerseys})
 
-                    # Merge OCR numbers into jersey map if Claude found a player match
+                    # Merge OCR + Claude jersey discoveries
                     for ev in events:
-                        player = ev.get("player", "")
-                        if player and player not in ("UNKNOWN_TITANS", "RIVAL") and ocr_numbers:
+                        pname = ev.get("player", "")
+                        if pname and pname not in ("UNKNOWN_TITANS", "RIVAL") and ocr_numbers:
                             best_ocr = max(ocr_numbers, key=lambda x: x["confidence"])
-                            if best_ocr["number"] not in learned_jerseys:
-                                learned_jerseys[best_ocr["number"]] = player
+                            num = best_ocr["number"]
+                            if num not in learned_jerseys and best_ocr["confidence"] >= 0.6:
+                                learned_jerseys[num] = pname
 
                     for ev in events:
                         await emit_event(

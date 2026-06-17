@@ -1048,6 +1048,21 @@ document.addEventListener('DOMContentLoaded', () => {
     btn.textContent = '⏳ Starting...';
     document.getElementById('btnStopAuto').classList.remove('hidden');
 
+    // Read AI setup panel values
+    const titansColor = (document.getElementById('titansColor')?.value || 'gray/white').trim();
+    const rivalColor  = (document.getElementById('rivalColor')?.value  || 'colored').trim();
+    // Parse player hints textarea into {"player name": "description"} dict
+    const playerProfiles = {};
+    const hintsRaw = document.getElementById('playerHints')?.value || '';
+    hintsRaw.split('\n').forEach(line => {
+      const idx = line.indexOf(':');
+      if (idx > 0) {
+        const pname = line.slice(0, idx).trim();
+        const hint  = line.slice(idx + 1).trim();
+        if (pname && hint) playerProfiles[pname] = hint;
+      }
+    });
+
     const r = await fetch('/api/full-auto', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1056,7 +1071,10 @@ document.addEventListener('DOMContentLoaded', () => {
         session_id: sessionId,
         players: S.players,
         jersey_map: jerseyMap,
-        score_interval: 5,
+        score_interval: 3,
+        player_profiles: playerProfiles,
+        titans_jersey_color: titansColor,
+        rival_jersey_color: rivalColor,
       }),
     });
     const d = await r.json();
@@ -1068,7 +1086,7 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
     btn.textContent = '🔄 Running...';
-    setStatus('🚀 Full Auto started — downloading video, will scan every play automatically...', 'info');
+    setStatus('🚀 Full Auto started — warmup scan → jersey detection → full game analysis...', 'info');
   });
 
   document.getElementById('btnStopAuto').addEventListener('click', async () => {

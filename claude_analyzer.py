@@ -150,114 +150,155 @@ If Titans are not visible or score is unclear, use null. Do not guess."""
 async def analyze_play_sequence(
     frame_paths: list[str],
     players: list[str],
-    jersey_map: dict,          # {"7": "Joseph Gabay", "11": "Aaron Breziner", ...}
-    score_before: dict,        # {"titans": 10, "rival": 14}
-    score_after: dict,         # {"titans": 12, "rival": 14}
+    jersey_map: dict,
+    score_before: dict,
+    score_after: dict,
     video_ts: str,
-) -> list[dict]:
+    player_profiles: dict | None = None,
+    titans_jersey_color: str = "gray/white",
+    rival_jersey_color: str = "colored (yellow, red, blue, etc.)",
+) -> tuple:
     """
-    Send a 6-frame clip sequence to Claude Vision.
-    Detects who scored/fouled by reading jersey numbers.
-    Returns list of events like analyze_chunk.
+    Copa Talento-optimized multi-signal play analysis.
+    Uses jersey colors, crop regions, and physical profiles for player ID.
+    Returns (events, jersey_numbers_seen, play_description).
     """
     if not frame_paths:
-        return []
+        return [], {}, ""
 
     titans_delta = (score_after.get("titans") or 0) - (score_before.get("titans") or 0)
     rival_delta  = (score_after.get("rival") or 0)  - (score_before.get("rival") or 0)
 
-    # Build roster string with jersey numbers if known
-    if jersey_map:
-        roster_lines = []
-        for p in players:
-            num = next((n for n, name in jersey_map.items() if name == p), "?")
-            roster_lines.append(f"  #{num} — {p}")
-        roster_str = "\n".join(roster_lines)
-    else:
-        roster_str = "\n".join(f"  {p}" for p in players)
+    # Build roster string with jersey numbers and profiles
+    roster_lines = []
+    for p in players:
+        num = next((n for n, name in jersey_map.items() if name == p), "?")
+        profile = (player_profiles or {}).get(p, "")
+        line = f"  #{num} — {p}"
+        if profile:
+            line += f" ({profile})"
+        roster_lines.append(line)
+    roster_str = "\n".join(roster_lines) if roster_lines else "\n".join(f"  {p}" for p in players)
 
     score_desc = []
     if titans_delta > 0:
-        score_desc.append(f"Titans scored +{titans_delta} (now {score_after['titans']})")
+        pt_type = {1: "FREE THROW(S)", 2: "2-POINTER", 3: "3-POINTER"}.get(titans_delta, f"+{titans_delta} pts")
+        score_desc.append(f"TITANS scored {pt_type} → now {score_after['titans']}")
     if rival_delta > 0:
-        score_desc.append(f"Rival scored +{rival_delta} (now {score_after['rival']})")
+        pt_type = {1: "FREE THROW(S)", 2: "2-POINTER", 3: "3-POINTER"}.get(rival_delta, f"+{rival_delta} pts")
+        score_desc.append(f"RIVAL scored {pt_type} → now {score_after['rival']}")
     if not score_desc:
-        score_desc = ["Score unchanged — possible foul, timeout, or replay"]
-    score_summary = " | ".join(score_desc)
+        score_desc = ["Score unchanged — possible foul, timeout, or dead ball"]
+    score_summary = "\n".join(score_desc)
 
-    prompt = f"""You are watching {len(frame_paths)} consecutive frames from a basketball game broadcast (frames in order, ~1 second apart).
+    # Select crop regions based on play type (what to zoom in on)
+    crop_instructions = ""
+    crop_regions = []
+    if titans_delta == 1 or rival_delta == 1:
+        # Free throw: shooter alone at foul line, center of court
+        crop_regions = [(0.3, 0.35, 0.7, 0.75)]   # center vertically (foul line zone)
+        crop_instructions = "IMPORTANT: This is a FREE THROW (+1 pt). The shooter is ALONE at the foul line in the CENTER of the court. The camera often ZOOMS IN for free throws. Look at the zoomed crop image."
+    elif titans_delta == 3 or rival_delta == 3:
+        # 3-pointer: shooter behind the arc (outer perimeter)
+        crop_regions = [(0.0, 0.2, 0.5, 0.65), (0.5, 0.2, 1.0, 0.65)]  # left/right perimeter
+        crop_instructions = "IMPORTANT: This is a 3-POINTER. The shooter was BEHIND the 3-point arc (outer edges of the court). Look for a player celebrating or holding their follow-through pose."
+    else:
+        # 2-pointer: player was near the basket (in the paint)
+        crop_regions = [(0.25, 0.3, 0.75, 0.85)]  # paint area
+        crop_instructions = "IMPORTANT: This is a 2-POINTER. The scorer was near the BASKET (in the key/paint). Look for the player closest to the basket."
 
-What happened in this play window:
+    prompt = f"""You are analyzing frames from a Copa Talento Colegial U18 basketball broadcast in Panama.
+
+═══ BROADCAST PROFILE ═══
+• Camera: Fixed elevated wide-angle, full-court view from scorer's table side
+• Scoreboard: Bottom-RIGHT corner — team name + score + clock + quarter ("1st", "2nd", etc.)
+• TITANS jersey color: {titans_jersey_color} (light gray or white)
+• RIVAL jersey color: {rival_jersey_color}
+• Referee: Black shirt. Scorer's table crew: white shirts.
+
+═══ WHAT HAPPENED ═══
 {score_summary}
-Video time: {video_ts}
+Timestamp: {video_ts}
+{crop_instructions}
 
-Titans roster (with jersey numbers if known):
+═══ TITANS ROSTER ═══
 {roster_str}
 
-Your job: identify every INDIVIDUAL event in these frames.
+═══ YOUR TASK ═══
+Step 1 — TEAM CONFIRMATION: Confirm WHICH team scored based on jersey color near the basket.
+Step 2 — PLAYER IDENTIFICATION: Use every available signal:
+  a) Jersey NUMBER on shirt (front or back) — even partially visible numbers count
+  b) Physical appearance: height, build, skin tone, hair
+  c) Court position: Who is at the foul line (FT)? Who is in the paint (2PT)? Who is at the arc (3PT)?
+  d) Post-play behavior: The scorer often pumps fist, raises arms, looks at bench
+  e) Team huddle: After play, teammates often rush to the scorer
+  f) Any TEXT OVERLAYS: Player name graphics, "FOUL ON #X", scoreboard text
+  g) Player profiles if provided (height, position tendency, etc.)
 
-How to identify players:
-1. Read jersey numbers on the back or front of jerseys — match to the roster above
-2. Look at who has the ball, who is shooting, who is at the free throw line
-3. If you see "FOUL ON #X" or any text overlay — read it exactly
-4. Look at the scoreboard — team foul count changes tell you a foul happened
-5. Free throw situation = foul happened earlier; the FT shooter = the fouled player
-
-Events to detect and report:
-- 2PT_MADE / 2PT_MISS (inside the 3-point arc)
-- 3PT_MADE / 3PT_MISS (behind the 3-point arc)
-- FT_MADE / FT_MISS (free throw line)
-- FOUL (player who committed the foul)
-- REB_OFF / REB_DEF (if clearly visible)
-- BLK / STL (if clearly visible)
+Step 3 — SECONDARY EVENTS: Also look for:
+  • Rebounds after misses (who catches the ball?)
+  • Assists (who passed to the scorer right before?)
+  • Steals or blocks (if clearly visible)
+  • Team fouls on the scoreboard (did it increment?)
 
 Return ONLY valid JSON:
 {{
   "events": [
     {{
-      "player": "exact player name from roster, or RIVAL",
+      "player": "exact name from roster, or UNKNOWN_TITANS, or RIVAL",
       "team": "titans" or "rival",
-      "stat": "one stat key from the list above",
+      "stat": "2PT_MADE|3PT_MADE|FT_MADE|2PT_MISS|3PT_MISS|FT_MISS|REB_OFF|REB_DEF|AST|STL|BLK|FOUL",
       "confidence": 0.0 to 1.0,
-      "reasoning": "jersey #X visible | text overlay says | player at FT line | etc."
+      "reasoning": "specific visual evidence: jersey color + number + position + behavior"
     }}
   ],
-  "jersey_numbers_seen": {{"7": "visible on player at basket"}},
-  "play_description": "one sentence describing what happened"
+  "jersey_numbers_seen": {{}},
+  "titans_jersey_visible": true or false,
+  "play_description": "one sentence describing the play"
 }}
 
-Confidence guide:
-- 0.9+ : jersey number clearly readable AND matches a known play
-- 0.7-0.9 : jersey partially visible OR play type inferred from position
-- 0.5-0.7 : educated guess from context
-- below 0.5 : do not include the event
-
-If you cannot identify the specific player with ≥0.5 confidence, use "UNKNOWN_TITANS" or "RIVAL"."""
+Confidence:
+• 0.9+: jersey # clearly visible + matches a known play
+• 0.75-0.9: jersey partially readable OR physical match + position match
+• 0.6-0.75: team confirmed (jersey color) + strong positional inference
+• 0.5-0.6: team confirmed but player uncertain → use UNKNOWN_TITANS
+• <0.5: do not include"""
 
     try:
+        # Build content: full frames first, then crop zooms, then prompt
         content = []
         for path in frame_paths:
-            with open(path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode()
             content.append({
                 "type": "image",
-                "source": {"type": "base64", "media_type": "image/jpeg", "data": img_data}
+                "source": {"type": "base64", "media_type": "image/jpeg",
+                           "data": _encode_frame(path, max_dim=720)}
             })
+
+        # Add crop zoom images (labeled via text)
+        if crop_regions and frame_paths:
+            # Use the middle frame for cropping (most likely to show the play)
+            mid_frame = frame_paths[len(frame_paths) // 2]
+            content.append({"type": "text", "text": "=== ZOOMED CROP OF KEY AREA ==="})
+            for region in crop_regions:
+                cropped = _crop_and_encode(mid_frame, region, zoom=2.5)
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": cropped}
+                })
+
         content.append({"type": "text", "text": prompt})
 
         def _call():
             return get_client().messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=800,
+                max_tokens=900,
                 messages=[{"role": "user", "content": content}]
             ).content[0].text
 
         loop = asyncio.get_event_loop()
         raw = await loop.run_in_executor(None, _call)
-        raw = raw.strip()
-        raw = re.sub(r"```(?:json)?\s*", "", raw).strip()
-        s = raw.find('{')
-        e = raw.rfind('}')
+        raw = re.sub(r"```(?:json)?\s*", "", raw.strip()).strip()
+        s, e = raw.find('{'), raw.rfind('}')
         if s != -1 and e != -1:
             data = json.loads(raw[s:e+1])
             return data.get("events", []), data.get("jersey_numbers_seen", {}), data.get("play_description", "")
@@ -280,6 +321,33 @@ def _compress_frame(path: str, max_dim: int = 480) -> bytes:
     except Exception:
         with open(path, "rb") as f:
             return f.read()
+
+
+def _encode_frame(path: str, max_dim: int = 720, quality: int = 75) -> str:
+    """Encode frame as base64 JPEG string for Claude API."""
+    return base64.b64encode(_compress_frame(path, max_dim)).decode()
+
+
+def _crop_and_encode(frame_path: str, region: tuple, zoom: float = 2.0, quality: int = 80) -> str:
+    """
+    Crop a rectangular region from a frame, zoom it up, and return base64 JPEG.
+    region = (left_frac, top_frac, right_frac, bottom_frac) — fractions of image size.
+    """
+    try:
+        img = Image.open(frame_path).convert("RGB")
+        w, h = img.size
+        l = int(region[0] * w); t = int(region[1] * h)
+        r = int(region[2] * w); b = int(region[3] * h)
+        crop = img.crop((l, t, r, b))
+        new_w = int((r - l) * zoom)
+        new_h = int((b - t) * zoom)
+        zoomed = crop.resize((max(new_w, 120), max(new_h, 120)), Image.LANCZOS)
+        buf = io.BytesIO()
+        zoomed.save(buf, "JPEG", quality=quality)
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception as e:
+        print(f"crop error: {e}")
+        return _encode_frame(frame_path, max_dim=480)
 
 
 async def quick_score_check(frame_path: str) -> dict:
@@ -343,6 +411,123 @@ Use null if not visible. Numbers only, no extra text."""
     except Exception as e:
         print(f"quick_score_check: {e}")
     return {"titans": None, "rival": None, "quarter": None, "clock": None}
+
+
+async def scan_frame_for_jerseys(frame_path: str, players: list[str], jersey_map: dict) -> dict:
+    """
+    Dedicated jersey-number extraction scan — optimized for close-up or warmup frames
+    where players are larger and numbers more readable.
+    Returns {"jersey_map_updates": {"7": "Gabay"}, "descriptions": {"7": "tall player, light skin"}}
+    """
+    roster_str = "\n".join(f"  - {p}" for p in players)
+    already_known = "\n".join(f"  #{k} = {v}" for k, v in jersey_map.items()) if jersey_map else "  (none yet)"
+
+    prompt = f"""Scan this basketball frame for jersey numbers. This may be a warmup, timeout, or sideline shot where players are CLOSE to the camera.
+
+Titans roster (find jersey numbers for as many as possible):
+{roster_str}
+
+Already known jersey → player mappings:
+{already_known}
+
+INSTRUCTIONS:
+1. Look at EVERY visible jersey number in the frame
+2. For Titans players (gray/white jerseys): read the number, match to roster name if possible
+3. A player's number is on their CHEST and BACK
+4. Even if partially obscured, write down what you can read
+5. Note physical description to help match to roster (height, build, hair, skin)
+
+Return ONLY valid JSON:
+{{
+  "jerseys_found": [
+    {{
+      "number": "7",
+      "team": "titans" or "rival",
+      "confidence": 0.0 to 1.0,
+      "player_name": "exact roster name or null",
+      "description": "tall, dark hair, light skin — standing near scorer table"
+    }}
+  ],
+  "close_up": true or false,
+  "warmup_or_timeout": true or false
+}}"""
+
+    try:
+        img_data = _encode_frame(frame_path, max_dim=720, quality=85)
+        # Also add zoomed crops of left and right sides (where players often stand)
+        left_crop = _crop_and_encode(frame_path, (0.0, 0.1, 0.5, 0.9), zoom=2.0)
+        right_crop = _crop_and_encode(frame_path, (0.5, 0.1, 1.0, 0.9), zoom=2.0)
+
+        def _call():
+            return get_client().messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=600,
+                messages=[{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_data}},
+                    {"type": "text", "text": "Full frame:"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": left_crop}},
+                    {"type": "text", "text": "Zoomed left side:"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": right_crop}},
+                    {"type": "text", "text": "Zoomed right side:"},
+                    {"type": "text", "text": prompt},
+                ]}]
+            ).content[0].text
+
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(None, _call)
+        raw = re.sub(r"```(?:json)?\s*", "", raw.strip()).strip()
+        s, e = raw.find('{'), raw.rfind('}')
+        if s != -1 and e != -1:
+            data = json.loads(raw[s:e+1])
+            result = {"jersey_map_updates": {}, "descriptions": {}}
+            for j in data.get("jerseys_found", []):
+                num = str(j.get("number", "")).strip()
+                if num and j.get("team") == "titans" and j.get("confidence", 0) >= 0.55:
+                    pname = j.get("player_name")
+                    if pname and pname in players:
+                        result["jersey_map_updates"][num] = pname
+                    if j.get("description"):
+                        result["descriptions"][num] = j["description"]
+            return result
+    except Exception as err:
+        print(f"jersey scan error: {err}")
+    return {"jersey_map_updates": {}, "descriptions": {}}
+
+
+async def detect_team_jersey_colors(frame_path: str) -> dict:
+    """
+    Detect the jersey colors of each team from a frame.
+    Returns {"titans_color": "gray/white", "rival_color": "yellow"}
+    Used once at the start to customize prompts.
+    """
+    try:
+        img_data = _encode_frame(frame_path, max_dim=480)
+        prompt = """Basketball broadcast frame. Two teams are playing.
+One team is called TITANS (look for this name on the scoreboard).
+
+Identify the jersey colors:
+Return ONLY JSON: {"titans_color": "color description", "rival_color": "color description", "rival_name": "team name from scoreboard or null"}
+Example: {"titans_color": "light gray/white", "rival_color": "bright yellow", "rival_name": "Aguilas"}"""
+
+        def _call():
+            return get_client().messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=80,
+                messages=[{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_data}},
+                    {"type": "text", "text": prompt},
+                ]}]
+            ).content[0].text
+
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(None, _call)
+        raw = re.sub(r"```(?:json)?\s*", "", raw.strip()).strip()
+        s, e = raw.find('{'), raw.rfind('}')
+        if s != -1 and e != -1:
+            return json.loads(raw[s:e+1])
+    except Exception as err:
+        print(f"color detect error: {err}")
+    return {"titans_color": "gray/white", "rival_color": "colored"}
 
 
 async def analyze_transcription_chunks(segments: list[dict], players: list[str]) -> list[dict]:

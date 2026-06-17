@@ -201,6 +201,19 @@ html, body { height: 100%; font-family: 'Helvetica Neue', Arial, sans-serif; bac
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 .hidden { display: none !important; }
 
+/* ── AI Setup Panel ── */
+.ai-setup-panel { margin-top: 10px; padding: 10px 12px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; }
+.ai-setup-panel .section-label { margin-bottom: 8px; }
+.setup-hint { font-size: 0.65rem; color: var(--text2); font-weight: 400; text-transform: none; }
+.setup-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.setup-row.full { flex-direction: column; align-items: flex-start; }
+.setup-row label { font-size: 0.7rem; color: var(--text2); white-space: nowrap; min-width: 90px; }
+.setup-input { flex: 1; background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 4px; color: var(--text); padding: 3px 7px; font-size: 0.75rem; width: 100%; }
+.setup-input:focus { border-color: var(--gold); outline: none; }
+.setup-textarea { width: 100%; min-height: 70px; background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 4px; color: var(--text); padding: 5px 7px; font-size: 0.72rem; resize: vertical; font-family: inherit; line-height: 1.5; }
+.setup-textarea:focus { border-color: var(--gold); outline: none; }
+.setup-textarea::placeholder { color: rgba(255,255,255,0.2); }
+
 /* ── Responsive ── */
 @media (max-width: 768px) {
   .main-grid { grid-template-columns: 1fr; }
