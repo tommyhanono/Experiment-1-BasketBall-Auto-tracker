@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>🏀 Titans Auto Tracker — Experiment 1</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- TOP BAR -->
+<header class="topbar">
+  <div class="topbar-left">
+    <span class="logo">🏀</span>
+    <input id="gameName" class="game-name-input" value="Titans vs ___" maxlength="40">
+  </div>
+  <div class="topbar-center">
+    <input id="ytUrl" class="url-input" placeholder="Paste YouTube URL here..." type="url">
+    <button id="btnStart" class="btn-start">▶ Start AI</button>
+    <button id="btnStop" class="btn-stop hidden">■ Stop</button>
+  </div>
+  <div class="topbar-right">
+    <button id="btnReport" class="btn-action">📄 Report</button>
+    <button id="btnNewGame" class="btn-action secondary">↺ New</button>
+  </div>
+</header>
+
+<!-- STATUS BAR -->
+<div id="statusBar" class="status-bar hidden">
+  <div id="statusMsg" class="status-msg">Ready</div>
+  <div class="progress-track"><div id="progressFill" class="progress-fill" style="width:0%"></div></div>
+</div>
+
+<!-- MAIN LAYOUT -->
+<main class="main-grid">
+
+  <!-- LEFT: Video + Scoreboard -->
+  <section class="left-panel">
+    <div class="scoreboard">
+      <div class="score-side titans-side">
+        <div class="score-label">TITANS</div>
+        <div class="score-num" id="titansScore">0</div>
+      </div>
+      <div class="score-mid">
+        <div class="quarter-display" id="quarterDisplay">Q1</div>
+        <div class="clock-display" id="clockDisplay">10:00</div>
+        <div class="clock-controls">
+          <button id="btnClock" class="btn-clock">▶</button>
+          <button id="btnResetClock" class="btn-clock-sm">↺</button>
+        </div>
+        <div class="quarter-btns" id="quarterBtns"></div>
+      </div>
+      <div class="score-side rival-side">
+        <div class="score-label">RIVAL</div>
+        <div class="score-num" id="rivalScore">0</div>
+        <div class="rival-controls">
+          <button class="rival-btn" onclick="adjustRival(2)">+2</button>
+          <button class="rival-btn" onclick="adjustRival(3)">+3</button>
+          <button class="rival-btn" onclick="adjustRival(1)">+1</button>
+          <button class="rival-btn neg" onclick="adjustRival(-1)">−</button>
+        </div>
+        <div class="rival-fouls">
+          Fouls: <span id="rivalFouls">0</span>
+          <button class="rival-btn sm" onclick="adjustRivalFoul(1)">+</button>
+          <button class="rival-btn sm neg" onclick="adjustRivalFoul(-1)">−</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="videoContainer" class="video-container">
+      <div class="video-placeholder" id="videoPlaceholder">
+        <div class="placeholder-icon">▶</div>
+        <div class="placeholder-text">Paste a YouTube URL above and click Start AI</div>
+      </div>
+      <iframe id="ytFrame" class="yt-frame hidden" allow="autoplay; encrypted-media" allowfullscreen></iframe>
+    </div>
+  </section>
+
+  <!-- RIGHT: Players + Stats -->
+  <section class="right-panel">
+    <div class="player-section">
+      <div class="section-label">PLAYERS</div>
+      <div id="playerList" class="player-list"></div>
+      <div class="player-actions">
+        <button class="btn-sm" id="btnAdd">+ Add</button>
+        <button class="btn-sm danger" id="btnRemove">− Remove</button>
+        <button class="btn-sm" id="btnUndo">↩ Undo</button>
+      </div>
+    </div>
+
+    <div class="stat-section">
+      <div class="active-player-badge" id="activeBadge">
+        <span id="activeName">Select a player</span>
+        <span id="activeStatus" class="status-dot out">○ Fuera</span>
+      </div>
+      <div id="statGrid" class="stat-grid"></div>
+    </div>
+  </section>
+</main>
+
+<!-- AI EVENT FEED -->
+<section class="feed-section">
+  <div class="feed-header">
+    <span class="feed-title">🤖 AI Event Feed</span>
+    <span id="feedCounter" class="feed-counter">0 events detected</span>
+    <button class="btn-sm" id="btnConfirmAll">✓ Confirm All High Confidence</button>
+    <button class="btn-sm" id="btnToggleTable">📊 Stats Table</button>
+  </div>
+
+  <div id="eventFeed" class="event-feed">
+    <div class="feed-empty">No events yet. Start tracking a game to see AI-detected plays.</div>
+  </div>
+</section>
+
+<!-- STATS TABLE (hidden by default) -->
+<section id="tableSection" class="table-section hidden">
+  <div class="table-header">
+    <span>STATS TABLE</span>
+    <button class="btn-sm" id="btnCloseTable">✕</button>
+  </div>
+  <div class="table-scroll">
+    <table id="statsTable" class="stats-table"></table>
+  </div>
+</section>
+
+<!-- TOAST -->
+<div id="toast" class="toast"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
