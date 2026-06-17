@@ -103,8 +103,14 @@
   <div class="feed-header">
     <span class="feed-title">🤖 AI Event Feed</span>
     <span id="feedCounter" class="feed-counter">0 events detected</span>
-    <button class="btn-sm" id="btnConfirmAll">✓ Confirm All High Confidence</button>
-    <button class="btn-sm" id="btnToggleTable">📊 Stats Table</button>
+    <div class="vision-controls">
+      <input id="frameTs" class="ts-input" placeholder="MM:SS" title="Current video timestamp" type="text" size="5">
+      <button class="btn-sm vision" id="btnAnalyzeFrame">📷 Analyze Frame</button>
+      <button class="btn-sm vision" id="btnStartScan">🔄 Auto Scan</button>
+      <button class="btn-sm danger hidden" id="btnStopScan">■ Stop</button>
+    </div>
+    <button class="btn-sm" id="btnConfirmAll">✓ Confirm All</button>
+    <button class="btn-sm" id="btnToggleTable">📊 Table</button>
   </div>
 
   <div id="eventFeed" class="event-feed">

@@ -616,17 +616,38 @@ function handleServerMsg(msg) {
       setProgress(msg.pct);
       if (msg.done) setTimeout(() => hideStatus(), 3000);
       break;
+    case 'vision_progress':
+      setProgress(msg.pct);
+      setStatus(`📷 Scanning frames... ${msg.frame}/${msg.total} (${msg.pct}%)`, 'info');
+      break;
     case 'video_info':
-      if (msg.title) document.getElementById('gameName').value = `Titans vs ${msg.title.split(' ')[0]}`;
+      if (msg.title) document.getElementById('gameName').value = `Titans vs ${msg.title.slice(0, 30)}`;
       break;
     case 'ai_event':
       addAiEvent(msg);
+      break;
+    case 'score_update':
+      applyScoreUpdate(msg);
       break;
     case 'error':
       setStatus(`❌ ${msg.msg}`, 'error');
       break;
     case 'heartbeat':
       break;
+  }
+}
+
+function applyScoreUpdate(msg) {
+  if (msg.titans_score !== null && msg.titans_score !== undefined) {
+    const el = document.getElementById('titansScore');
+    // Only update if AI score is higher than current (monotonic — scores only go up)
+    if (el && msg.titans_score > parseInt(el.textContent || '0')) {
+      toast(`📷 Score updated: Titans ${msg.titans_score} | ${msg.quarter || ''} ${msg.clock || ''}`);
+    }
+  }
+  if (msg.rival_score !== null && msg.rival_score !== undefined) {
+    S.rivalScore = Math.max(S.rivalScore || 0, msg.rival_score);
+    updateScores();
   }
 }
 
@@ -919,6 +940,57 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btnCloseTable').addEventListener('click', () =>
     document.getElementById('tableSection').classList.add('hidden')
   );
+
+  // Vision controls
+  document.getElementById('btnAnalyzeFrame').addEventListener('click', async () => {
+    const url = document.getElementById('ytUrl').value.trim();
+    if (!url) { toast('Enter a YouTube URL first'); return; }
+    const tsRaw = document.getElementById('frameTs').value.trim();
+    let timestamp = 60;
+    if (tsRaw) {
+      const parts = tsRaw.split(':').map(Number);
+      timestamp = parts.length === 2 ? parts[0] * 60 + parts[1] : parts[0];
+    }
+    connectWS();
+    await new Promise(r => setTimeout(r, 300));
+    const r = await fetch('/api/analyze-frame', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, session_id: sessionId, players: S.players, timestamp }),
+    });
+    const d = await r.json();
+    if (d.error) toast(`❌ ${d.error}`);
+    else setStatus(`📷 Analyzing frame @${Math.floor(timestamp/60)}:${String(timestamp%60).padStart(2,'0')}...`, 'info');
+  });
+
+  document.getElementById('btnStartScan').addEventListener('click', async () => {
+    const url = document.getElementById('ytUrl').value.trim();
+    if (!url) { toast('Enter a YouTube URL first'); return; }
+    if (!confirm('Auto Scan downloads frames every 45 seconds for the full game.\nThis may take a while. Continue?')) return;
+    connectWS();
+    await new Promise(r => setTimeout(r, 300));
+    const r = await fetch('/api/start-vision-scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, session_id: sessionId, players: S.players, interval: 45 }),
+    });
+    const d = await r.json();
+    if (d.error) { toast(`❌ ${d.error}`); return; }
+    document.getElementById('btnStartScan').classList.add('hidden');
+    document.getElementById('btnStopScan').classList.remove('hidden');
+    setStatus('📷 Auto scan started...', 'info');
+  });
+
+  document.getElementById('btnStopScan').addEventListener('click', async () => {
+    await fetch('/api/stop-vision-scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    document.getElementById('btnStartScan').classList.remove('hidden');
+    document.getElementById('btnStopScan').classList.add('hidden');
+    setStatus('Scan stopped.', 'warn');
+  });
 
   document.getElementById('playerList').addEventListener('click', e => {
     const pb = e.target.closest('.player-btn');

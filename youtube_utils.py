@@ -1,5 +1,8 @@
 import asyncio
 import re
+import os
+import subprocess
+import tempfile
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
 
 
@@ -82,8 +85,13 @@ async def get_transcript_chunks(url: str, chunk_minutes: int = 8) -> list[dict]:
     current_start = 0.0
 
     for seg in segments:
-        start = seg.get("start", 0)
-        text = seg.get("text", "").strip()
+        # Handle both dict and FetchedTranscriptSnippet objects
+        if hasattr(seg, 'start'):
+            start = seg.start
+            text = seg.text.strip() if hasattr(seg, 'text') else ''
+        else:
+            start = seg.get("start", 0)
+            text = seg.get("text", "").strip()
         if not text:
             continue
 
@@ -125,9 +133,89 @@ async def get_live_transcript_since(url: str, since_seconds: float) -> list[dict
         try:
             api = YouTubeTranscriptApi()
             result = api.fetch(video_id, languages=["es", "en"])
-            return [s for s in result if s.get("start", 0) > since_seconds]
+            def seg_start(s):
+                return s.start if hasattr(s, 'start') else s.get("start", 0)
+            return [s for s in result if seg_start(s) > since_seconds]
         except Exception:
             return []
 
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _fetch)
+
+
+def _find_ffmpeg() -> tuple[str, str]:
+    """Return (ffmpeg_binary_path, directory_for_yt_dlp_flag)."""
+    import shutil
+    # 1. System PATH
+    sys_ffmpeg = shutil.which("ffmpeg")
+    if sys_ffmpeg:
+        return sys_ffmpeg, os.path.dirname(sys_ffmpeg)
+    # 2. imageio bundled binary — ensure a symlink named "ffmpeg" exists
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.exists(exe):
+            ffdir = os.path.dirname(exe)
+            fflink = os.path.join(ffdir, "ffmpeg")
+            if not os.path.exists(fflink):
+                os.symlink(exe, fflink)
+            return fflink, ffdir
+    except Exception:
+        pass
+    # 3. ~/bin
+    home = os.path.expanduser("~/bin/ffmpeg")
+    if os.path.exists(home):
+        return home, os.path.dirname(home)
+    raise RuntimeError("ffmpeg not found. Run: pip install imageio[ffmpeg]")
+
+
+async def extract_frame_at(url: str, timestamp: int, frames_dir: str) -> str | None:
+    """Download a 4-second clip at `timestamp` and extract one JPEG frame."""
+    os.makedirs(frames_dir, exist_ok=True)
+    clip_path = os.path.join(frames_dir, f"clip_{timestamp}.mp4")
+    frame_path = os.path.join(frames_dir, f"frame_{timestamp}.jpg")
+
+    try:
+        ffmpeg_bin, ffmpeg_dir = _find_ffmpeg()
+    except RuntimeError as e:
+        print(f"extract_frame_at: {e}")
+        return None
+
+    # Download a 4-second segment with yt-dlp at low quality
+    dl_cmd = [
+        "yt-dlp",
+        "--ffmpeg-location", ffmpeg_dir,
+        "-f", "best[height<=480][ext=mp4]/best[height<=480]/best",
+        "--download-sections", f"*{timestamp}-{timestamp+4}",
+        "--no-playlist", "-q", "--no-warnings",
+        "-o", clip_path, url,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *dl_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        )
+        await asyncio.wait_for(proc.wait(), timeout=60)
+    except (asyncio.TimeoutError, Exception) as e:
+        print(f"yt-dlp error: {e}")
+        return None
+
+    if not os.path.exists(clip_path):
+        return None
+
+    # Extract 1 frame with ffmpeg
+    ff_cmd = [ffmpeg_bin, "-y", "-i", clip_path, "-vframes", "1", "-q:v", "3", frame_path]
+    try:
+        proc2 = await asyncio.create_subprocess_exec(
+            *ff_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        )
+        await asyncio.wait_for(proc2.wait(), timeout=15)
+    except (asyncio.TimeoutError, Exception) as e:
+        print(f"ffmpeg error: {e}")
+        return None
+    finally:
+        try:
+            os.remove(clip_path)
+        except Exception:
+            pass
+
+    return frame_path if os.path.exists(frame_path) else None

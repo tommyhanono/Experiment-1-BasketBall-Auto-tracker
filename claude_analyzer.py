@@ -72,7 +72,7 @@ Rules:
     def _call():
         resp = get_client().messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=800,
+            max_tokens=1500,
             messages=[{"role": "user", "content": prompt}]
         )
         return resp.content[0].text
@@ -81,10 +81,13 @@ Rules:
     try:
         raw = await loop.run_in_executor(None, _call)
         raw = raw.strip()
-        # Extract JSON if wrapped in code blocks
-        m = re.search(r'\{.*\}', raw, re.DOTALL)
-        if m:
-            data = json.loads(m.group())
+        # Strip markdown code fences first
+        raw = re.sub(r"```(?:json)?\s*", "", raw).strip()
+        # Find JSON object
+        start = raw.find('{')
+        end = raw.rfind('}')
+        if start != -1 and end != -1:
+            data = json.loads(raw[start:end+1])
             return data.get("events", [])
     except Exception as e:
         print(f"Analyzer error: {e}")
@@ -98,31 +101,28 @@ async def analyze_frame_for_stats(image_path: str, players: list[str], context: 
             image_data = base64.b64encode(f.read()).decode()
 
         roster_str = ", ".join(players)
-        prompt = f"""Analyze this basketball broadcast frame.
+        prompt = f"""You are analyzing a basketball broadcast frame. The tracked team is "Titans".
 
-Titans players: {roster_str}
+Titans roster: {roster_str}
 Context: {context}
 
-Extract from the image:
-1. Score (Titans score and opponent score if visible)
-2. Game clock / quarter
-3. Any player name graphics or stat overlays visible on screen
-4. Any play-by-play text graphics
-
-Return ONLY valid JSON:
+Extract ONLY what is clearly visible. Return ONLY valid JSON:
 {{
-  "titans_score": null or number,
-  "rival_score": null or number,
-  "quarter": null or string,
-  "clock": null or string,
+  "titans_score": null or integer (Titans team score if visible),
+  "rival_score": null or integer (opposing team score if visible),
+  "rival_name": null or string (opponent team name if visible),
+  "quarter": null or string (e.g. "Q1", "1st", "2nd half"),
+  "clock": null or string (game clock if visible, e.g. "02:27"),
   "player_events": [],
-  "text_on_screen": "any text visible"
-}}"""
+  "text_on_screen": "brief description of any text or graphics visible"
+}}
+
+If Titans are not visible or score is unclear, use null. Do not guess."""
 
         def _call():
             resp = get_client().messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=400,
+                max_tokens=300,
                 messages=[{
                     "role": "user",
                     "content": [
@@ -135,9 +135,12 @@ Return ONLY valid JSON:
 
         loop = asyncio.get_event_loop()
         raw = await loop.run_in_executor(None, _call)
-        m = re.search(r'\{.*\}', raw, re.DOTALL)
-        if m:
-            return json.loads(m.group())
+        raw = raw.strip()
+        raw = re.sub(r"```(?:json)?\s*", "", raw).strip()
+        start = raw.find('{')
+        end = raw.rfind('}')
+        if start != -1 and end != -1:
+            return json.loads(raw[start:end+1])
     except Exception as e:
         print(f"Frame analyzer error: {e}")
     return {}

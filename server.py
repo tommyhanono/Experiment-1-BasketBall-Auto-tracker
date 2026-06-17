@@ -8,8 +8,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from youtube_utils import get_transcript_chunks, get_video_info, get_live_transcript_since, extract_video_id
-from claude_analyzer import analyze_chunk
+from youtube_utils import get_transcript_chunks, get_video_info, get_live_transcript_since, extract_video_id, extract_frame_at
+from claude_analyzer import analyze_chunk, analyze_frame_for_stats
 
 app = FastAPI(title="Titans Basketball Auto Tracker")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -48,6 +48,19 @@ class StartReq(BaseModel):
 
 class StopReq(BaseModel):
     session_id: str
+
+class VisionReq(BaseModel):
+    url: str
+    session_id: str
+    players: list[str]
+    timestamp: int = 60        # video timestamp in seconds to analyze
+    scan_interval: int = 0     # 0 = single frame, >0 = auto-scan every N seconds
+
+class VisionScanReq(BaseModel):
+    url: str
+    session_id: str
+    players: list[str]
+    interval: int = 45         # seconds between frame captures
 
 
 @app.get("/")
@@ -189,3 +202,160 @@ async def run_live_pipeline(url: str, sid: str, players: list[str]):
                 })
 
         await manager.send(sid, {"type": "heartbeat", "last_ts": last_ts})
+
+
+# ── Vision Analysis Endpoints ──────────────────────────────────────────────
+
+@app.post("/api/analyze-frame")
+async def analyze_single_frame(req: VisionReq, bg: BackgroundTasks):
+    """Analyze one frame at a specific timestamp via Claude Vision."""
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        return {"error": "ANTHROPIC_API_KEY missing"}
+    bg.add_task(vision_single_frame, req.url, req.session_id, req.players, req.timestamp)
+    return {"status": "started", "timestamp": req.timestamp}
+
+
+@app.post("/api/start-vision-scan")
+async def start_vision_scan(req: VisionScanReq, bg: BackgroundTasks):
+    """Start automated frame scanning every N seconds."""
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        return {"error": "ANTHROPIC_API_KEY missing"}
+
+    key = f"vision_{req.session_id}"
+    if key in active_tasks:
+        active_tasks[key].cancel()
+
+    task = asyncio.create_task(
+        vision_scan_pipeline(req.url, req.session_id, req.players, req.interval)
+    )
+    active_tasks[key] = task
+    return {"status": "scanning", "interval": req.interval}
+
+
+@app.post("/api/stop-vision-scan")
+async def stop_vision_scan(req: StopReq):
+    key = f"vision_{req.session_id}"
+    task = active_tasks.pop(key, None)
+    if task:
+        task.cancel()
+    return {"status": "stopped"}
+
+
+async def vision_single_frame(url: str, sid: str, players: list[str], timestamp: int):
+    frames_dir = f"/tmp/frames_{sid}"
+    ts_fmt = f"{timestamp//60}:{timestamp%60:02d}"
+
+    await manager.send(sid, {
+        "type": "status",
+        "msg": f"📷 Downloading frame at {ts_fmt}... (~10s)",
+        "level": "info"
+    })
+
+    frame_path = await extract_frame_at(url, timestamp, frames_dir)
+    if not frame_path:
+        await manager.send(sid, {"type": "status", "msg": f"⚠ Could not extract frame at {ts_fmt}", "level": "warn"})
+        return
+
+    await manager.send(sid, {"type": "status", "msg": f"🔍 Analyzing frame with Claude Vision...", "level": "info"})
+    result = await analyze_frame_for_stats(frame_path, players, f"Video time {ts_fmt}")
+
+    try:
+        os.remove(frame_path)
+        os.rmdir(frames_dir)
+    except Exception:
+        pass
+
+    # Send score update
+    if result.get("titans_score") is not None or result.get("rival_score") is not None:
+        await manager.send(sid, {
+            "type": "score_update",
+            "titans_score": result.get("titans_score"),
+            "rival_score": result.get("rival_score"),
+            "quarter": result.get("quarter"),
+            "clock": result.get("clock"),
+            "video_ts": ts_fmt,
+        })
+
+    # Send any player events detected in graphics
+    for ev in result.get("player_events", []):
+        await manager.send(sid, {
+            "type": "ai_event",
+            "id": str(uuid.uuid4())[:8],
+            "source": "vision",
+            "video_ts": ts_fmt,
+            **ev
+        })
+
+    text_on_screen = result.get("text_on_screen", "")
+    msg = f"📷 Frame @{ts_fmt}: "
+    if result.get("titans_score") is not None:
+        msg += f"Score {result.get('titans_score')}-{result.get('rival_score')} {result.get('quarter','')} {result.get('clock','')} | "
+    msg += text_on_screen[:60] if text_on_screen else "(no text detected)"
+    await manager.send(sid, {"type": "status", "msg": msg, "level": "success"})
+
+
+async def vision_scan_pipeline(url: str, sid: str, players: list[str], interval: int):
+    """Auto-scan video frames at regular intervals."""
+    info = await get_video_info(url)
+    duration = info.get("duration", 0) if info else 0
+
+    if not duration:
+        await manager.send(sid, {"type": "status", "msg": "⚠ Could not get video duration for scan", "level": "warn"})
+        return
+
+    frames_dir = f"/tmp/frames_{sid}_scan"
+    start_ts = 30  # Skip first 30s (usually pre-game)
+    timestamps = list(range(start_ts, min(duration, 7200), interval))
+    total = len(timestamps)
+
+    await manager.send(sid, {
+        "type": "status",
+        "msg": f"📷 Vision scan started — {total} frames to analyze ({interval}s interval)",
+        "level": "info"
+    })
+
+    try:
+        for i, ts in enumerate(timestamps):
+            if f"vision_{sid}" not in active_tasks:
+                break
+
+            frame_path = await extract_frame_at(url, ts, frames_dir)
+            if frame_path:
+                result = await analyze_frame_for_stats(frame_path, players, f"Video {ts//60}:{ts%60:02d}")
+                try:
+                    os.remove(frame_path)
+                except Exception:
+                    pass
+
+                if result.get("titans_score") is not None or result.get("rival_score") is not None:
+                    await manager.send(sid, {
+                        "type": "score_update",
+                        "titans_score": result.get("titans_score"),
+                        "rival_score": result.get("rival_score"),
+                        "quarter": result.get("quarter"),
+                        "clock": result.get("clock"),
+                        "video_ts": f"{ts//60}:{ts%60:02d}",
+                    })
+
+                for ev in result.get("player_events", []):
+                    await manager.send(sid, {
+                        "type": "ai_event",
+                        "id": str(uuid.uuid4())[:8],
+                        "source": "vision",
+                        "video_ts": f"{ts//60}:{ts%60:02d}",
+                        **ev
+                    })
+
+            pct = int(((i + 1) / total) * 100)
+            await manager.send(sid, {"type": "vision_progress", "pct": pct, "frame": i + 1, "total": total})
+            await asyncio.sleep(0.3)
+
+        await manager.send(sid, {"type": "status", "msg": "✓ Vision scan complete!", "level": "success"})
+    except asyncio.CancelledError:
+        pass
+    finally:
+        try:
+            os.rmdir(frames_dir)
+        except Exception:
+            pass
+        active_tasks.pop(f"vision_{sid}", None)
