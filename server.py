@@ -904,7 +904,7 @@ async def full_auto_pipeline(
                     )
                 cv_scorer  = cv_result.get("scorer")
                 cv_assist  = cv_result.get("assister")
-                cv_steal   = cv_result.get("steal")
+                # STL removed from tracked stats
                 cv_tracks  = cv_result.get("player_tracks", {})
 
                 # Map CV track IDs → player names via jersey learning
@@ -930,11 +930,6 @@ async def full_auto_pipeline(
                         if assist_player:
                             await emit_event("cv_tracking", play_fmt, assist_player, "titans", "AST",
                                              cv_assist["confidence"], f"CV assist: passed to scorer")
-                    if cv_steal:
-                        steal_player = tid_to_player(cv_steal["track_id"])
-                        if steal_player:
-                            await emit_event("cv_tracking", play_fmt, steal_player, "titans", "STL",
-                                             cv_steal["confidence"], "CV possession change")
 
                 # ── Layer 2: Extract 8 frames from the play window ────────
                 play_tss = [play_ts + int(j * (score_interval * 2) / 7) for j in range(8)]

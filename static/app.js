@@ -22,13 +22,12 @@ const STAT_CFG = [
   { key: 'REB_DEF', label: 'Reb. Defensivo', color: '#7d5d12' },
   { key: 'AST',     label: 'Asistencia',     color: '#1f6090' },
   { key: 'TOV',     label: 'Pérdida',        color: '#7b241c' },
-  { key: 'STL',     label: 'Robo',           color: '#6c3483' },
   { key: 'BLK',     label: 'Bloqueo',        color: '#0e6251' },
   { key: 'FOUL',    label: 'Falta',          color: '#a93226' },
 ];
 
 const ALL_STAT_KEYS = ['2PT_MADE', '2PT_ATT', '3PT_MADE', '3PT_ATT', 'FT_MADE', 'FT_ATT',
-  'REB_OFF', 'REB_DEF', 'AST', 'TOV', 'STL', 'BLK', 'FOUL'];
+  'REB_OFF', 'REB_DEF', 'AST', 'TOV', 'BLK', 'FOUL'];
 
 /* STAT key → readable label for event feed */
 const STAT_LABELS = {
@@ -36,8 +35,8 @@ const STAT_LABELS = {
   '3PT_MADE': '✓ 3PT', '3PT_MISS': '✗ 3PT',
   'FT_MADE':  '✓ TL',  'FT_MISS':  '✗ TL',
   'REB_OFF': 'Reb. Ofensivo', 'REB_DEF': 'Reb. Defensivo',
-  'AST': 'Asistencia', 'TOV': 'Pérdida',
-  'STL': 'Robo', 'BLK': 'Bloqueo', 'FOUL': 'Falta',
+  'AST': 'Asistencia ⚠', 'TOV': 'Pérdida',
+  'BLK': 'Bloqueo', 'FOUL': 'Falta',
 };
 
 /* ═══ STATE ════════════════════════════════════════════════════════════════ */
@@ -465,9 +464,8 @@ const TABLE_COLS = [
   { h: 'R.Of', fn: p => S.stats[p].REB_OFF, total: () => totStat('REB_OFF') },
   { h: 'R.Def', fn: p => S.stats[p].REB_DEF, total: () => totStat('REB_DEF') },
   { h: 'REB',  fn: p => S.stats[p].REB_OFF + S.stats[p].REB_DEF, total: () => totStat('REB_OFF') + totStat('REB_DEF') },
-  { h: 'AST',  fn: p => S.stats[p].AST, total: () => totStat('AST') },
+  { h: 'AST*', fn: p => S.stats[p].AST, total: () => totStat('AST'), disclaimer: true },
   { h: 'TOV',  fn: p => S.stats[p].TOV, total: () => totStat('TOV') },
-  { h: 'ROB',  fn: p => S.stats[p].STL, total: () => totStat('STL') },
   { h: 'BLQ',  fn: p => S.stats[p].BLK, total: () => totStat('BLK') },
   { h: 'FALT', fn: p => S.stats[p].FOUL, total: () => totStat('FOUL'),
     cellClass: p => S.stats[p].FOUL >= 5 ? 'falt-5' : S.stats[p].FOUL >= 4 ? 'falt-4' : '' },
@@ -477,7 +475,11 @@ function renderTable() {
   const tbl = document.getElementById('statsTable');
   if (!tbl) return;
   const headers = ['Jugador', ...TABLE_COLS.map(c => c.h)];
-  let html = '<thead><tr>' + headers.map(h => `<th>${h}</th>`).join('') + '</tr></thead><tbody>';
+  let html = '<thead><tr>' + headers.map(h => `<th title="${h === 'AST*' ? 'Asistencias — precisión ~65% con AI. Se recomienda confirmar manualmente.' : h}">${h}</th>`).join('') + '</tr></thead>';
+  if (TABLE_COLS.some(c => c.disclaimer)) {
+    html += '<caption style="caption-side:bottom;font-size:0.65rem;color:#aaa;padding:4px 0">* AST: precisión AI ~65% — verifica con Quick Stats</caption>';
+  }
+  html += '<tbody>';
   S.players.forEach(p => {
     const cls = [p === S.selected ? 'selected' : '', S.fouledOut[p] ? 'row-fouled-out' : ''].filter(Boolean).join(' ');
     html += `<tr${cls ? ` class="${cls}"` : ''}><td>${shortName(p)}${S.fouledOut[p] ? '*' : ''}</td>`;
@@ -746,7 +748,7 @@ function handleServerMsg(msg) {
                                            playerName.toLowerCase().includes(p.split(' ')[0].toLowerCase()));
         if (!matched) return;
         if (!S.stats[matched]) S.stats[matched] = {};
-        const statMap = { PTS: null, REB: 'REB_DEF', AST: 'AST', STL: 'STL', BLK: 'BLK', FOUL: 'FOUL' };
+        const statMap = { PTS: null, REB: 'REB_DEF', AST: 'AST', BLK: 'BLK', FOUL: 'FOUL' };
         Object.entries(stats || {}).forEach(([k, v]) => {
           if (v != null && statMap[k]) {
             const sk = statMap[k];
@@ -957,14 +959,15 @@ function generateReport() {
 <tr><td>3PT% (triples)</td><td>${thA > 0 ? pct1(thM / thA) : '--'} (${thM}/${thA})</td></tr>
 <tr><td>FT% (tiros libres)</td><td>${ftA > 0 ? pct1(ftM / ftA) : '--'} (${ftM}/${ftA}) ${ftA >= 5 && ftM / ftA < 0.5 ? '⚠️' : ''}</td></tr>
 <tr><td>Rebotes totales</td><td>${totStat('REB_OFF') + totStat('REB_DEF')} (Of: ${totStat('REB_OFF')} / Def: ${totStat('REB_DEF')})</td></tr>
-<tr><td>Asistencias totales</td><td>${totStat('AST')}</td></tr>
+<tr><td>Asistencias totales *</td><td>${totStat('AST')}</td></tr>
 <tr><td>Pérdidas de balón</td><td>${totStat('TOV')}</td></tr>
-<tr><td>Robos / Bloqueos</td><td>${totStat('STL')} / ${totStat('BLK')}</td></tr>
+<tr><td>Bloqueos</td><td>${totStat('BLK')}</td></tr>
 <tr><td>Faltas totales</td><td>${totStat('FOUL')}</td></tr>
 ${rivalPts !== null ? `<tr><td>Diferencia final</td><td>${teamPts - rivalPts > 0 ? '+' : ''}${teamPts - rivalPts} ${teamPts > rivalPts ? '✅' : '❌'}</td></tr>` : ''}
 </table></section>
-<section><h3>Estadísticas Individuales</h3><table class="stats-table"><thead><tr><th>Jugador</th><th>MIN</th><th>PT</th><th>2PT M/A</th><th>3PT M/A</th><th>TL M/A</th><th>FG%</th><th>FT%</th><th>TO</th><th>REB</th><th>AST</th><th>FALT</th><th>Notas</th></tr></thead><tbody>${playerRowsHtml}</tbody>
-<tfoot><tr class="total-row"><td>TOTAL</td><td>${fmtMin(totalMins())}</td><td>${teamPts}</td><td>${totStat('2PT_MADE')}/${totStat('2PT_ATT')}</td><td>${totStat('3PT_MADE')}/${totStat('3PT_ATT')}</td><td>${totStat('FT_MADE')}/${totStat('FT_ATT')}</td><td>${teamFgA > 0 ? pct1(teamFgM / teamFgA) : '--'}</td><td>${ftA > 0 ? pct1(ftM / ftA) : '--'}</td><td>${totStat('TOV')}</td><td>${totStat('REB_OFF') + totStat('REB_DEF')}</td><td>${totStat('AST')}</td><td>${totStat('FOUL')}</td><td></td></tr></tfoot></table></section>
+<section><h3>Estadísticas Individuales</h3><table class="stats-table"><thead><tr><th>Jugador</th><th>MIN</th><th>PT</th><th>2PT M/A</th><th>3PT M/A</th><th>TL M/A</th><th>FG%</th><th>FT%</th><th>TO</th><th>REB</th><th title="Asistencias — precisión AI ~65%. Se recomienda verificar manualmente.">AST *</th><th>FALT</th><th>Notas</th></tr></thead><tbody>${playerRowsHtml}</tbody>
+<tfoot><tr class="total-row"><td>TOTAL</td><td>${fmtMin(totalMins())}</td><td>${teamPts}</td><td>${totStat('2PT_MADE')}/${totStat('2PT_ATT')}</td><td>${totStat('3PT_MADE')}/${totStat('3PT_ATT')}</td><td>${totStat('FT_MADE')}/${totStat('FT_ATT')}</td><td>${teamFgA > 0 ? pct1(teamFgM / teamFgA) : '--'}</td><td>${ftA > 0 ? pct1(ftM / ftA) : '--'}</td><td>${totStat('TOV')}</td><td>${totStat('REB_OFF') + totStat('REB_DEF')}</td><td>${totStat('AST')}</td><td>${totStat('FOUL')}</td><td></td></tr></tfoot></table>
+<p style="font-size:0.7rem;color:#777;margin-top:4px">* AST: asistencias detectadas por visión AI — precisión aproximada 65%. Se recomienda confirmar con registro manual.</p></section>
 <section><h3>Jugadores Destacados</h3>${topPlayersHtml}</section>
 <section><h3>Recomendaciones para el Próximo Partido</h3><ul class="rec-list">${recs.map(r => `<li>${r}</li>`).join('')}</ul></section>
 </div></body></html>`;
