@@ -16,7 +16,9 @@
   </div>
   <div class="topbar-center">
     <input id="ytUrl" class="url-input" placeholder="Paste YouTube URL here..." type="url">
-    <button id="btnStart" class="btn-start">▶ Start AI</button>
+    <button id="btnFullAuto" class="btn-full-auto" title="Download video, scan every play, identify scorers automatically">🚀 Full Auto</button>
+    <button id="btnStopAuto" class="btn-stop hidden">■ Stop</button>
+    <button id="btnStart" class="btn-start secondary-start" title="Transcript-only AI (for videos with captions)">▶ Transcript</button>
     <button id="btnStop" class="btn-stop hidden">■ Stop</button>
   </div>
   <div class="topbar-right">
@@ -104,10 +106,11 @@
     <span class="feed-title">🤖 AI Event Feed</span>
     <span id="feedCounter" class="feed-counter">0 events detected</span>
     <div class="vision-controls">
-      <input id="frameTs" class="ts-input" placeholder="MM:SS" title="Current video timestamp" type="text" size="5">
-      <button class="btn-sm vision" id="btnAnalyzeFrame">📷 Analyze Frame</button>
-      <button class="btn-sm vision" id="btnStartScan">🔄 Auto Scan</button>
-      <button class="btn-sm danger hidden" id="btnStopScan">■ Stop</button>
+      <button class="btn-sm smart" id="btnSmartScan">🤖 Smart Scan</button>
+      <button class="btn-sm danger hidden" id="btnStopSmartScan">■ Stop</button>
+      <span class="scan-sep">|</span>
+      <input id="frameTs" class="ts-input" placeholder="MM:SS" title="Video timestamp" type="text" size="5">
+      <button class="btn-sm vision" id="btnAnalyzeFrame">📷 Frame</button>
     </div>
     <button class="btn-sm" id="btnConfirmAll">✓ Confirm All</button>
     <button class="btn-sm" id="btnToggleTable">📊 Table</button>

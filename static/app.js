@@ -46,6 +46,8 @@ let sessionId = crypto.randomUUID();
 let ws = null;
 let aiEvents = [];
 let eventCount = 0;
+let jerseyMap = {};          // {"7": "Joseph Gabay"} — learned/set by user
+let smartScanActive = false;
 
 function newState() {
   const players = [...DEFAULT_PLAYERS];
@@ -247,7 +249,25 @@ function renderPlayers() {
       cBtn.textContent = '○ Fuera';
     }
 
-    wrap.append(btn, cBtn);
+    // Jersey number input (for Smart Scan auto-detection)
+    const jerseyNum = Object.entries(jerseyMap).find(([n, name]) => name === p)?.[0] || '';
+    const jerseyInput = document.createElement('input');
+    jerseyInput.className = 'jersey-input';
+    jerseyInput.type = 'number';
+    jerseyInput.min = '0';
+    jerseyInput.max = '99';
+    jerseyInput.placeholder = '#';
+    jerseyInput.title = 'Jersey number (helps AI identify who scored)';
+    jerseyInput.value = jerseyNum;
+    jerseyInput.addEventListener('change', () => {
+      const num = jerseyInput.value.trim();
+      // Remove old mapping for this player
+      Object.keys(jerseyMap).forEach(k => { if (jerseyMap[k] === p) delete jerseyMap[k]; });
+      if (num) jerseyMap[num] = p;
+      saveState();
+    });
+
+    wrap.append(btn, jerseyInput, cBtn);
     list.appendChild(wrap);
   });
 }
@@ -620,6 +640,52 @@ function handleServerMsg(msg) {
       setProgress(msg.pct);
       setStatus(`📷 Scanning frames... ${msg.frame}/${msg.total} (${msg.pct}%)`, 'info');
       break;
+    case 'scan_tick':
+      setProgress(msg.pct);
+      if (msg.changed) setStatus(`⚡ Score change @${msg.video_ts} — analyzing play...`, 'info');
+      break;
+    case 'jersey_update':
+      // Merge AI-learned jersey numbers into our map
+      Object.entries(msg.map || {}).forEach(([num, name]) => {
+        if (S.players.includes(name) && !jerseyMap[num]) {
+          jerseyMap[num] = name;
+          toast(`🔍 Learned: #${num} = ${name}`);
+        }
+      });
+      renderPlayers();
+      break;
+    case 'smart_scan_started':
+      smartScanActive = true;
+      document.getElementById('btnSmartScan').classList.add('hidden');
+      document.getElementById('btnStopSmartScan').classList.remove('hidden');
+      break;
+    case 'smart_scan_done':
+      smartScanActive = false;
+      document.getElementById('btnSmartScan').classList.remove('hidden');
+      document.getElementById('btnStopSmartScan').classList.add('hidden');
+      if (msg.learned_jerseys) {
+        Object.assign(jerseyMap, msg.learned_jerseys);
+        renderPlayers();
+      }
+      break;
+    case 'auto_progress': {
+      setProgress(msg.pct);
+      const phaseLabel = {download: '⬇ Downloading', scanning: '🔍 Scanning', audio: '🎙 Audio'}[msg.phase] || '';
+      if (phaseLabel) setStatus(`${phaseLabel}... ${msg.pct}%`, 'info');
+      break;
+    }
+    case 'auto_phase':
+      break;
+    case 'auto_done': {
+      const btn = document.getElementById('btnFullAuto');
+      if (btn) { btn.disabled = false; btn.textContent = '🚀 Full Auto'; }
+      document.getElementById('btnStopAuto').classList.add('hidden');
+      if (msg.learned_jerseys) {
+        Object.assign(jerseyMap, msg.learned_jerseys);
+        renderPlayers();
+      }
+      break;
+    }
     case 'video_info':
       if (msg.title) document.getElementById('gameName').value = `Titans vs ${msg.title.slice(0, 30)}`;
       break;
@@ -925,6 +991,55 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btnResetClock').addEventListener('click', resetClock);
   document.getElementById('btnStart').addEventListener('click', startTracking);
   document.getElementById('btnStop').addEventListener('click', stopTracking);
+
+  // ── Full Auto — the one button to rule them all ──────────────────────────
+  document.getElementById('btnFullAuto').addEventListener('click', async () => {
+    const url = document.getElementById('ytUrl').value.trim();
+    if (!url) { toast('Paste a YouTube URL first'); return; }
+
+    connectWS();
+    await new Promise(r => setTimeout(r, 400));
+
+    const btn = document.getElementById('btnFullAuto');
+    btn.disabled = true;
+    btn.textContent = '⏳ Starting...';
+    document.getElementById('btnStopAuto').classList.remove('hidden');
+
+    const r = await fetch('/api/full-auto', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url,
+        session_id: sessionId,
+        players: S.players,
+        jersey_map: jerseyMap,
+        score_interval: 5,
+      }),
+    });
+    const d = await r.json();
+    if (d.error) {
+      toast(`❌ ${d.error}`);
+      btn.disabled = false;
+      btn.textContent = '🚀 Full Auto';
+      document.getElementById('btnStopAuto').classList.add('hidden');
+      return;
+    }
+    btn.textContent = '🔄 Running...';
+    setStatus('🚀 Full Auto started — downloading video, will scan every play automatically...', 'info');
+  });
+
+  document.getElementById('btnStopAuto').addEventListener('click', async () => {
+    await fetch('/api/stop-full-auto', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    const btn = document.getElementById('btnFullAuto');
+    btn.disabled = false;
+    btn.textContent = '🚀 Full Auto';
+    document.getElementById('btnStopAuto').classList.add('hidden');
+    setStatus('Full Auto stopped.', 'warn');
+  });
   document.getElementById('btnReport').addEventListener('click', generateReport);
   document.getElementById('btnNewGame').addEventListener('click', newGame);
   document.getElementById('btnUndo').addEventListener('click', undoLast);
@@ -990,6 +1105,52 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('btnStartScan').classList.remove('hidden');
     document.getElementById('btnStopScan').classList.add('hidden');
     setStatus('Scan stopped.', 'warn');
+  });
+
+  // Smart Scan — fully automatic play-by-play detection
+  document.getElementById('btnSmartScan').addEventListener('click', async () => {
+    const url = document.getElementById('ytUrl').value.trim();
+    if (!url) { toast('Enter a YouTube URL first'); return; }
+
+    const jerseyCount = Object.keys(jerseyMap).length;
+    const msg = jerseyCount > 0
+      ? `Smart Scan will auto-detect all plays using Claude Vision.\n${jerseyCount} jersey number(s) configured.\n\nStart?`
+      : `Smart Scan will auto-detect plays using Claude Vision.\n\nTip: enter jersey numbers (#) next to each player for better accuracy.\n\nStart anyway?`;
+    if (!confirm(msg)) return;
+
+    connectWS();
+    await new Promise(r => setTimeout(r, 400));
+
+    const r = await fetch('/api/start-smart-scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url,
+        session_id: sessionId,
+        players: S.players,
+        jersey_map: jerseyMap,
+        poll_interval: 12,
+        start_ts: 60,
+      }),
+    });
+    const d = await r.json();
+    if (d.error) { toast(`❌ ${d.error}`); return; }
+    smartScanActive = true;
+    document.getElementById('btnSmartScan').classList.add('hidden');
+    document.getElementById('btnStopSmartScan').classList.remove('hidden');
+    setStatus('🤖 Smart Scan running — watching every 12s for score changes...', 'info');
+  });
+
+  document.getElementById('btnStopSmartScan').addEventListener('click', async () => {
+    await fetch('/api/stop-smart-scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    smartScanActive = false;
+    document.getElementById('btnSmartScan').classList.remove('hidden');
+    document.getElementById('btnStopSmartScan').classList.add('hidden');
+    setStatus('Smart Scan stopped.', 'warn');
   });
 
   document.getElementById('playerList').addEventListener('click', e => {

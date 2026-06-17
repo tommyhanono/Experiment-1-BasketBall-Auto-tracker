@@ -1,5 +1,6 @@
-import os, json, re, base64, asyncio
+import os, json, re, base64, asyncio, io
 import anthropic
+from PIL import Image
 
 _client = None
 
@@ -144,3 +145,235 @@ If Titans are not visible or score is unclear, use null. Do not guess."""
     except Exception as e:
         print(f"Frame analyzer error: {e}")
     return {}
+
+
+async def analyze_play_sequence(
+    frame_paths: list[str],
+    players: list[str],
+    jersey_map: dict,          # {"7": "Joseph Gabay", "11": "Aaron Breziner", ...}
+    score_before: dict,        # {"titans": 10, "rival": 14}
+    score_after: dict,         # {"titans": 12, "rival": 14}
+    video_ts: str,
+) -> list[dict]:
+    """
+    Send a 6-frame clip sequence to Claude Vision.
+    Detects who scored/fouled by reading jersey numbers.
+    Returns list of events like analyze_chunk.
+    """
+    if not frame_paths:
+        return []
+
+    titans_delta = (score_after.get("titans") or 0) - (score_before.get("titans") or 0)
+    rival_delta  = (score_after.get("rival") or 0)  - (score_before.get("rival") or 0)
+
+    # Build roster string with jersey numbers if known
+    if jersey_map:
+        roster_lines = []
+        for p in players:
+            num = next((n for n, name in jersey_map.items() if name == p), "?")
+            roster_lines.append(f"  #{num} — {p}")
+        roster_str = "\n".join(roster_lines)
+    else:
+        roster_str = "\n".join(f"  {p}" for p in players)
+
+    score_desc = []
+    if titans_delta > 0:
+        score_desc.append(f"Titans scored +{titans_delta} (now {score_after['titans']})")
+    if rival_delta > 0:
+        score_desc.append(f"Rival scored +{rival_delta} (now {score_after['rival']})")
+    if not score_desc:
+        score_desc = ["Score unchanged — possible foul, timeout, or replay"]
+    score_summary = " | ".join(score_desc)
+
+    prompt = f"""You are watching {len(frame_paths)} consecutive frames from a basketball game broadcast (frames in order, ~1 second apart).
+
+What happened in this play window:
+{score_summary}
+Video time: {video_ts}
+
+Titans roster (with jersey numbers if known):
+{roster_str}
+
+Your job: identify every INDIVIDUAL event in these frames.
+
+How to identify players:
+1. Read jersey numbers on the back or front of jerseys — match to the roster above
+2. Look at who has the ball, who is shooting, who is at the free throw line
+3. If you see "FOUL ON #X" or any text overlay — read it exactly
+4. Look at the scoreboard — team foul count changes tell you a foul happened
+5. Free throw situation = foul happened earlier; the FT shooter = the fouled player
+
+Events to detect and report:
+- 2PT_MADE / 2PT_MISS (inside the 3-point arc)
+- 3PT_MADE / 3PT_MISS (behind the 3-point arc)
+- FT_MADE / FT_MISS (free throw line)
+- FOUL (player who committed the foul)
+- REB_OFF / REB_DEF (if clearly visible)
+- BLK / STL (if clearly visible)
+
+Return ONLY valid JSON:
+{{
+  "events": [
+    {{
+      "player": "exact player name from roster, or RIVAL",
+      "team": "titans" or "rival",
+      "stat": "one stat key from the list above",
+      "confidence": 0.0 to 1.0,
+      "reasoning": "jersey #X visible | text overlay says | player at FT line | etc."
+    }}
+  ],
+  "jersey_numbers_seen": {{"7": "visible on player at basket"}},
+  "play_description": "one sentence describing what happened"
+}}
+
+Confidence guide:
+- 0.9+ : jersey number clearly readable AND matches a known play
+- 0.7-0.9 : jersey partially visible OR play type inferred from position
+- 0.5-0.7 : educated guess from context
+- below 0.5 : do not include the event
+
+If you cannot identify the specific player with ≥0.5 confidence, use "UNKNOWN_TITANS" or "RIVAL"."""
+
+    try:
+        content = []
+        for path in frame_paths:
+            with open(path, "rb") as f:
+                img_data = base64.b64encode(f.read()).decode()
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": img_data}
+            })
+        content.append({"type": "text", "text": prompt})
+
+        def _call():
+            return get_client().messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=800,
+                messages=[{"role": "user", "content": content}]
+            ).content[0].text
+
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(None, _call)
+        raw = raw.strip()
+        raw = re.sub(r"```(?:json)?\s*", "", raw).strip()
+        s = raw.find('{')
+        e = raw.rfind('}')
+        if s != -1 and e != -1:
+            data = json.loads(raw[s:e+1])
+            return data.get("events", []), data.get("jersey_numbers_seen", {}), data.get("play_description", "")
+    except Exception as err:
+        print(f"Play sequence error: {err}")
+    return [], {}, ""
+
+
+def _compress_frame(path: str, max_dim: int = 480) -> bytes:
+    """Resize and compress a frame to reduce token usage for score-only checks."""
+    try:
+        img = Image.open(path)
+        w, h = img.size
+        if max(w, h) > max_dim:
+            scale = max_dim / max(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=60)
+        return buf.getvalue()
+    except Exception:
+        with open(path, "rb") as f:
+            return f.read()
+
+
+async def quick_score_check(frame_path: str) -> dict:
+    """
+    Fast, cheap score check — sends a compressed frame, asks only for numbers.
+    Returns {"titans": int|None, "rival": int|None, "quarter": str|None, "clock": str|None}.
+    """
+    try:
+        img_bytes = await asyncio.get_event_loop().run_in_executor(
+            None, _compress_frame, frame_path
+        )
+        img_data = base64.b64encode(img_bytes).decode()
+
+        prompt = """Basketball scoreboard frame. Extract ONLY the numbers from the scoreboard.
+Return ONLY JSON, no text:
+{"home":null,"away":null,"home_name":null,"away_name":null,"quarter":null,"clock":null}
+Use null if not visible. Numbers only, no extra text."""
+
+        def _call():
+            return get_client().messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=80,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_data}},
+                        {"type": "text", "text": prompt},
+                    ]
+                }]
+            ).content[0].text
+
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(None, _call)
+        raw = re.sub(r"```(?:json)?\s*", "", raw.strip()).strip()
+        s = raw.find('{')
+        e = raw.rfind('}')
+        if s != -1 and e != -1:
+            d = json.loads(raw[s:e+1])
+            home_name = (d.get("home_name") or "").upper()
+            away_name = (d.get("away_name") or "").upper()
+            # Identify which side is Titans
+            titans_is_home = "TITAN" in home_name
+            titans_is_away = "TITAN" in away_name
+            if titans_is_home:
+                titans_score, rival_score = d.get("home"), d.get("away")
+                rival_name = d.get("away_name")
+            elif titans_is_away:
+                titans_score, rival_score = d.get("away"), d.get("home")
+                rival_name = d.get("home_name")
+            else:
+                # Default: assume home=Titans (Copa Talento usually shows Titans on left)
+                titans_score, rival_score = d.get("home"), d.get("away")
+                rival_name = d.get("away_name")
+            return {
+                "titans": int(titans_score) if titans_score is not None else None,
+                "rival":  int(rival_score)  if rival_score  is not None else None,
+                "rival_name": rival_name,
+                "quarter": d.get("quarter"),
+                "clock": d.get("clock"),
+            }
+    except Exception as e:
+        print(f"quick_score_check: {e}")
+    return {"titans": None, "rival": None, "quarter": None, "clock": None}
+
+
+async def analyze_transcription_chunks(segments: list[dict], players: list[str]) -> list[dict]:
+    """
+    Break Whisper transcription segments into 5-minute chunks and analyze each with Claude.
+    Returns flat list of all events.
+    """
+    if not segments:
+        return []
+
+    chunk_secs = 5 * 60
+    chunks = []
+    current_texts = []
+    current_start = segments[0]["start"]
+
+    for seg in segments:
+        if seg["start"] - current_start >= chunk_secs and current_texts:
+            chunks.append({"start": current_start, "text": " ".join(current_texts)})
+            current_texts = [seg["text"]]
+            current_start = seg["start"]
+        else:
+            current_texts.append(seg["text"])
+
+    if current_texts:
+        chunks.append({"start": current_start, "text": " ".join(current_texts)})
+
+    all_events = []
+    for chunk in chunks:
+        ts_fmt = f"{int(chunk['start'])//60}:{int(chunk['start'])%60:02d}"
+        events = await analyze_chunk(chunk["text"], ts_fmt, players)
+        all_events.extend(events)
+        await asyncio.sleep(0.1)
+
+    return all_events
