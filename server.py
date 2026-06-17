@@ -21,6 +21,14 @@ from claude_analyzer import (
     extract_jersey_numbers_ocr, scan_frame_for_jerseys,
     detect_team_jersey_colors, detect_substitution,
 )
+from tracker import (
+    TeamClassifier, PlayerTracker, BallTracker, EventDetector,
+    analyze_clip as cv_analyze_clip,
+    analyze_clip_yolo,
+    scan_warmup_for_jerseys as cv_scan_warmup,
+    extract_player_crop,
+    YOLO_AVAILABLE,
+)
 
 app = FastAPI(title="Titans Basketball Auto Tracker")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -645,10 +653,13 @@ async def full_auto_pipeline(
     titans_color         = titans_jersey_color
     rival_color          = rival_jersey_color
     quarter_break_scanned = set()
-    # Minutes tracking: {player_name: [{"in": ts_sec, "out": ts_sec|None}]}
-    on_court_log         = {}   # who is currently on court (detected)
-    on_court_since       = {}   # {player: timestamp_seconds}
-    total_minutes        = {}   # {player: total_seconds_played}
+    # Minutes tracking
+    on_court_log         = {}
+    on_court_since       = {}
+    total_minutes        = {}
+    # CV Tracking: map YOLO/OpenCV track IDs → player names
+    warmup_track_to_player = {}   # {track_id: player_name}
+    cv_classifier          = TeamClassifier(titans_jersey_color, rival_jersey_color)
 
     async def status(msg, level="info"):
         await manager.send(sid, {"type": "status", "msg": msg, "level": level})
@@ -702,9 +713,49 @@ async def full_auto_pipeline(
 
         # ─── PHASE 2: Warmup scan (first 10 min → jersey number extraction) ──
         warmup_end = min(600, duration // 2)
-        if warmup_end > 60 and not all(n in learned_jerseys for n in [str(i) for i in range(1, 30)]):
+        if warmup_end > 60:
             await status(f"🔍 Warmup scan: scanning first {warmup_end//60}m for jersey numbers...")
             await manager.send(sid, {"type": "auto_phase", "phase": "warmup"})
+
+            # Layer A: CV scan for close-up player crops (fast, no API call)
+            if YOLO_AVAILABLE:
+                await status("🤖 YOLO player tracking active — highest accuracy mode", "success")
+            cv_close_ups = await loop.run_in_executor(
+                None, cv_scan_warmup, video_path, warmup_end, cv_classifier, 15
+            )
+            if cv_close_ups:
+                await status(f"📸 CV warmup: {len(cv_close_ups)} close-up player crops found for jersey reading")
+                # Feed best close-ups to Claude for jersey number reading
+                # Group by track_id, pick the largest bbox (most readable)
+                by_track = {}
+                for cu in cv_close_ups:
+                    tid = cu["track_id"]
+                    if tid not in by_track or cu["bbox"][3] > by_track[tid]["bbox"][3]:
+                        by_track[tid] = cu
+                # Ask Claude to read jersey numbers from the best crops
+                for tid, cu in list(by_track.items())[:10]:  # max 10 API calls
+                    crop = await loop.run_in_executor(
+                        None, extract_player_crop, video_path, cu["frame_idx"], cu["bbox"], 6
+                    )
+                    if crop is not None:
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False, dir=work_dir) as tf:
+                            import cv2 as _cv2
+                            _cv2.imwrite(tf.name, crop)
+                            crop_path = tf.name
+                        warmup_result = await scan_frame_for_jerseys(crop_path, players, learned_jerseys)
+                        try: os.remove(crop_path)
+                        except: pass
+                        updates = warmup_result.get("jersey_map_updates", {})
+                        for jnum, pname in updates.items():
+                            if jnum not in learned_jerseys:
+                                learned_jerseys[jnum] = pname
+                                warmup_track_to_player[tid] = pname
+                                await status(f"✓ CV+Claude: #{jnum} = {pname}", "success")
+                                await manager.send(sid, {"type": "jersey_update", "map": learned_jerseys})
+                        await asyncio.sleep(0.1)
+
+            # Layer B: Claude warmup scan (whole frames for remaining jerseys)
             warmup_timestamps = list(range(30, warmup_end, 30))
             warmup_frame = os.path.join(work_dir, "warmup_frame.jpg")
             jerseys_found_warmup = 0
@@ -723,7 +774,6 @@ async def full_auto_pipeline(
                             for num, name in new_found.items():
                                 await status(f"✓ Warmup: found #{num} = {name}", "success")
                             await manager.send(sid, {"type": "jersey_update", "map": learned_jerseys})
-                # Small delay to avoid hammering API
                 await asyncio.sleep(0.2)
             await status(f"✓ Warmup scan done — {jerseys_found_warmup} new jersey numbers found")
 
@@ -833,10 +883,60 @@ async def full_auto_pipeline(
 
             if titans_delta > 0 or rival_delta > 0:
                 play_ts  = max(60, ts - score_interval * 2)
+                play_end = ts + score_interval
                 play_fmt = f"{play_ts//60}:{play_ts%60:02d}"
+                score_delta_cv = {"titans": titans_delta, "rival": rival_delta}
                 await status(f"⚡ @{play_fmt}: Titans+{titans_delta} Rival+{rival_delta} — analyzing play...")
 
-                # ── Extract 8 frames from the play window ─────────────────
+                # ── Layer 1: CV Tracking — YOLO preferred, OpenCV fallback ─
+                cv_result = None
+                if YOLO_AVAILABLE:
+                    cv_result = await loop.run_in_executor(
+                        None, analyze_clip_yolo,
+                        video_path, float(play_ts), float(play_end),
+                        score_delta_cv, titans_color, rival_color,
+                    )
+                if cv_result is None:
+                    cv_result = await loop.run_in_executor(
+                        None, cv_analyze_clip,
+                        video_path, float(play_ts), float(play_end),
+                        score_delta_cv, titans_color, rival_color,
+                    )
+                cv_scorer  = cv_result.get("scorer")
+                cv_assist  = cv_result.get("assister")
+                cv_steal   = cv_result.get("steal")
+                cv_tracks  = cv_result.get("player_tracks", {})
+
+                # Map CV track IDs → player names via jersey learning
+                # (track_id from warmup scan → learned_jerseys entry)
+                def tid_to_player(tid):
+                    return warmup_track_to_player.get(tid)
+
+                if cv_scorer and cv_scorer.get("confidence", 0) >= 0.60:
+                    cv_player = tid_to_player(cv_scorer["track_id"])
+                    cv_team   = cv_scorer.get("team", "titans")
+                    cv_stype  = cv_scorer.get("shot_type", "2PT")
+                    cv_zone   = cv_scorer.get("zone", "")
+                    cv_stat   = {"2PT": "2PT_MADE", "3PT": "3PT_MADE", "FT": "FT_MADE"}.get(cv_stype, "2PT_MADE")
+                    if cv_player and cv_team == "titans":
+                        await emit_event(
+                            "cv_tracking", play_fmt,
+                            cv_player, "titans", cv_stat,
+                            cv_scorer["confidence"],
+                            f"CV tracking: {cv_zone} | {cv_result.get('summary','')}",
+                        )
+                    if cv_assist and cv_assist.get("confidence", 0) >= 0.50:
+                        assist_player = tid_to_player(cv_assist["track_id"])
+                        if assist_player:
+                            await emit_event("cv_tracking", play_fmt, assist_player, "titans", "AST",
+                                             cv_assist["confidence"], f"CV assist: passed to scorer")
+                    if cv_steal:
+                        steal_player = tid_to_player(cv_steal["track_id"])
+                        if steal_player:
+                            await emit_event("cv_tracking", play_fmt, steal_player, "titans", "STL",
+                                             cv_steal["confidence"], "CV possession change")
+
+                # ── Layer 2: Extract 8 frames from the play window ────────
                 play_tss = [play_ts + int(j * (score_interval * 2) / 7) for j in range(8)]
                 play_frames_data = await loop.run_in_executor(
                     None, extract_frames_local_batch, video_path, play_tss, work_dir
