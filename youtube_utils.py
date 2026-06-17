@@ -51,14 +51,21 @@ async def get_transcript_chunks(url: str, chunk_minutes: int = 8) -> list[dict]:
         return []
 
     def _fetch():
+        api = YouTubeTranscriptApi()
         try:
-            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=["es", "en", "auto"])
-            return transcript
+            result = api.fetch(video_id, languages=["es", "en"])
+            return list(result)
         except (NoTranscriptFound, TranscriptsDisabled):
             try:
-                transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
-                t = transcripts.find_generated_transcript(["es", "en"])
-                return t.fetch()
+                transcript_list = api.list(video_id)
+                t = transcript_list.find_generated_transcript(["es", "en"])
+                return list(t.fetch())
+            except Exception:
+                return []
+        except Exception:
+            try:
+                result = api.fetch(video_id)
+                return list(result)
             except Exception:
                 return []
 
@@ -116,8 +123,9 @@ async def get_live_transcript_since(url: str, since_seconds: float) -> list[dict
 
     def _fetch():
         try:
-            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=["es", "en"])
-            return [s for s in transcript if s.get("start", 0) > since_seconds]
+            api = YouTubeTranscriptApi()
+            result = api.fetch(video_id, languages=["es", "en"])
+            return [s for s in result if s.get("start", 0) > since_seconds]
         except Exception:
             return []
 
