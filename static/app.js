@@ -655,16 +655,28 @@ function handleServerMsg(msg) {
       setProgress(msg.pct);
       if (msg.changed) setStatus(`⚡ Score change @${msg.video_ts} — analyzing play...`, 'info');
       break;
-    case 'jersey_update':
-      // Merge AI-learned jersey numbers into our map
-      Object.entries(msg.map || {}).forEach(([num, name]) => {
-        if (S.players.includes(name) && !jerseyMap[num]) {
-          jerseyMap[num] = name;
-          toast(`🔍 Learned: #${num} = ${name}`);
+    case 'jersey_update': {
+      // Merge AI-learned jersey numbers (named players) into our map
+      const unknownNums = [];
+      Object.entries(msg.map || {}).forEach(([num, val]) => {
+        if (num.startsWith('_')) return; // skip meta keys like _titans_color
+        if (S.players.includes(val)) {
+          if (!jerseyMap[num]) {
+            jerseyMap[num] = val;
+            toast(`🔍 Aprendido: #${num} = ${val}`);
+          }
+        } else if (val && (val.includes('TITANS') || val.includes('Titans') || val.includes('gray')) && !jerseyMap[num]) {
+          // AI saw a Titans jersey number but doesn't know the player — ask user to assign
+          unknownNums.push(num);
         }
       });
+      // Show "unassigned Titans numbers" banner if we have some
+      if (unknownNums.length > 0) {
+        showUnassignedJerseys(unknownNums);
+      }
       renderPlayers();
       break;
+    }
     case 'smart_scan_started':
       smartScanActive = true;
       document.getElementById('btnSmartScan').classList.add('hidden');
@@ -1051,6 +1063,21 @@ function toast(msg) {
   _toastTimer = setTimeout(() => el.classList.remove('show'), 2800);
 }
 
+let _shownUnassigned = new Set();
+function showUnassignedJerseys(nums) {
+  const newNums = nums.filter(n => !_shownUnassigned.has(n) && !jerseyMap[n]);
+  if (newNums.length === 0) return;
+  newNums.forEach(n => _shownUnassigned.add(n));
+
+  const banner = document.createElement('div');
+  banner.className = 'unassigned-banner';
+  banner.innerHTML = `<strong>🔍 AI vio camiseta(s) Titans sin asignar: ${newNums.map(n=>`<b>#${n}</b>`).join(', ')}</strong>
+    <span style="font-size:0.82em;opacity:0.8"> — asigna en el panel de jugadores (campo #)</span>
+    <button onclick="this.parentElement.remove()" style="float:right;background:none;border:none;cursor:pointer;font-size:1.1em">✕</button>`;
+  document.body.appendChild(banner);
+  setTimeout(() => banner.remove(), 15000);
+}
+
 /* ═══ INIT ════════════════════════════════════════════════════════════════════ */
 document.addEventListener('DOMContentLoaded', () => {
   loadSaved();
@@ -1068,6 +1095,17 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btnFullAuto').addEventListener('click', async () => {
     const url = document.getElementById('ytUrl').value.trim();
     if (!url) { toast('Paste a YouTube URL first'); return; }
+
+    // Warn if jersey numbers are missing (they're critical for player ID)
+    const jerseyCount = Object.keys(jerseyMap).filter(k => !k.startsWith('_')).length;
+    if (jerseyCount === 0 && S.players.length > 0) {
+      const proceed = confirm(
+        '⚠️ Sin números de camiseta registrados.\n\n' +
+        'Para identificar jugadores automáticamente, ingresa el # de camiseta de cada jugador en el panel (campo # al lado del nombre).\n\n' +
+        '¿Continuar de todas formas? (La IA usará perfiles físicos, pero será menos preciso)'
+      );
+      if (!proceed) return;
+    }
 
     connectWS();
     await new Promise(r => setTimeout(r, 400));

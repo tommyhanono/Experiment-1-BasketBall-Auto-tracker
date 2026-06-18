@@ -18,7 +18,19 @@ import os
 import json
 import base64
 import tempfile
-from collections import defaultdict, deque
+from collections import defaultdict, deque, Counter
+
+# PaddleOCR — best-in-class for jersey number reading (3x better than EasyOCR per benchmarks)
+_paddle_ocr = None
+def _get_paddle():
+    global _paddle_ocr
+    if _paddle_ocr is None:
+        try:
+            from paddleocr import PaddleOCR
+            _paddle_ocr = PaddleOCR(lang='en', use_textline_orientation=False)
+        except Exception:
+            _paddle_ocr = False
+    return _paddle_ocr if _paddle_ocr is not False else None
 
 # Try to load YOLOv8 — best-in-class player/ball detection
 try:
@@ -825,18 +837,91 @@ def analyze_clip(
     return result
 
 
+def _torso_crop_and_enhance(frame: np.ndarray, bbox: tuple) -> np.ndarray | None:
+    """
+    Crop the torso region of a player (top 55% of bbox = number area).
+    Applies contrast enhancement pipeline recommended by jersey-number-pipeline paper.
+    """
+    x, y, w, h = bbox
+    fh, fw = frame.shape[:2]
+    # Torso = top 55% of player bbox (shoulder to hip), with small side padding
+    pad_x = max(2, int(w * 0.05))
+    x1 = max(0, x - pad_x)
+    y1 = max(0, y)
+    x2 = min(fw, x + w + pad_x)
+    y2 = min(fh, y + int(h * 0.55))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    crop = frame[y1:y2, x1:x2].copy()
+    if crop.size == 0 or crop.shape[0] < 8 or crop.shape[1] < 8:
+        return None
+    # Scale up 4x (minimum 80px tall for reliable OCR)
+    scale = max(4, int(80 / max(crop.shape[0], 1)))
+    crop = cv2.resize(crop, (crop.shape[1] * scale, crop.shape[0] * scale),
+                      interpolation=cv2.INTER_CUBIC)
+    # Contrast pipeline: convert to LAB, equalize L channel, sharpen
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    l = clahe.apply(l)
+    crop = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+    kernel = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]])
+    crop = cv2.filter2D(crop, -1, kernel)
+    return crop
+
+
+def _paddle_read_number(crop: np.ndarray) -> str | None:
+    """
+    Run PaddleOCR on a crop image and extract the jersey number.
+    Returns the number string (e.g. '11', '5') or None if not found.
+    """
+    ocr = _get_paddle()
+    if ocr is None or crop is None:
+        return None
+    try:
+        # PaddleOCR >= 2.9 uses predict() generator instead of ocr()
+        results = list(ocr.predict(
+            crop,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+        ))
+        if not results:
+            return None
+        candidates = []
+        for res in results:
+            texts  = res.get("rec_texts", [])
+            scores = res.get("rec_scores", [])
+            for text, conf in zip(texts, scores):
+                text = text.strip().replace(' ', '')
+                if text.isdigit() and 1 <= len(text) <= 2 and conf >= 0.5:
+                    candidates.append((text, conf))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda x: x[1])[0]
+    except Exception:
+        return None
+
+
 def scan_warmup_for_jerseys(
     video_path: str,
     duration_sec: int = 600,
     classifier: TeamClassifier = None,
-    every_n_sec: int = 15,
+    every_n_sec: int = 5,
 ) -> dict:
     """
-    Scan warmup period (first N seconds) to find CLOSE-UP frames where jersey
-    numbers are large enough to read.
+    Scan the video to extract jersey numbers for Titans players.
 
-    Returns dict of {track_id: {"team": "titans", "large_bbox_frames": [frame_idx, ...]}}
-    which can then be fed to Claude Vision for jersey number reading.
+    Pipeline (from jersey-number-pipeline paper, 91.4% accuracy):
+      1. YOLO detects players → bbox per frame
+      2. Filter: only large bboxes (>8% frame height = legible)
+      3. Crop torso region (shoulder→hip, top 55% of bbox)
+      4. Contrast enhancement (CLAHE + sharpen)
+      5. PaddleOCR reads number
+      6. Majority voting per track_id → confident jersey assignment
+
+    Returns: list of closeup frame dicts (for Claude fallback) + populates
+             jersey_votes dict {track_id: Counter({number: votes})}
     """
     if classifier is None:
         classifier = TeamClassifier()
@@ -847,12 +932,12 @@ def scan_warmup_for_jerseys(
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     end_frame = int(min(duration_sec, cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps) * fps)
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 360
+    MIN_BBOX_H = frame_h * 0.08   # legibility threshold
 
     player_tracker = PlayerTracker(classifier)
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 360
-
-    closeup_frames = []   # list of (timestamp_sec, frame, bbox) for large players
+    jersey_votes   = defaultdict(Counter)  # track_id → {number: count}
+    closeup_frames = []
 
     step = int(every_n_sec * fps)
     for pos in range(0, end_frame, step):
@@ -866,18 +951,28 @@ def scan_warmup_for_jerseys(
 
         for p in players:
             x, y, w, h = p["bbox"]
-            # "Close-up" threshold: player bbox height > 8% of frame height
-            if h >= frame_h * 0.08 and p["team"] == "titans":
-                closeup_frames.append({
-                    "ts": ts,
-                    "track_id": p["id"],
-                    "team": p["team"],
-                    "bbox": p["bbox"],
-                    "frame_idx": pos,
-                })
+            if h < MIN_BBOX_H or p["team"] != "titans":
+                continue
+
+            closeup_frames.append({
+                "ts": ts, "track_id": p["id"], "team": p["team"],
+                "bbox": p["bbox"], "frame_idx": pos,
+            })
+
+            # ── PaddleOCR on torso crop ────────────────────────────────
+            torso = _torso_crop_and_enhance(frame, (x, y, w, h))
+            num = _paddle_read_number(torso)
+            if num:
+                jersey_votes[p["id"]][num] += 1
 
     cap.release()
-    return closeup_frames
+
+    # Attach vote results to each closeup entry so server can use them
+    scan_result = {
+        "closeup_frames": closeup_frames,
+        "jersey_votes": {str(tid): dict(votes) for tid, votes in jersey_votes.items()},
+    }
+    return scan_result
 
 
 def extract_player_crop(video_path: str, frame_idx: int, bbox: tuple, padding: int = 4) -> np.ndarray | None:

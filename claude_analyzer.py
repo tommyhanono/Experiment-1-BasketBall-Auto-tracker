@@ -7,7 +7,13 @@ _client = None
 def get_client():
     global _client
     if _client is None:
-        _client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        # 80-second timeout on every HTTP request — prevents the pipeline hanging
+        # on a single stuck API call (we have asyncio.wait_for above, but that
+        # doesn't kill the thread; this kills the actual HTTP connection)
+        _client = anthropic.Anthropic(
+            api_key=os.getenv("ANTHROPIC_API_KEY"),
+            timeout=80.0,
+        )
     return _client
 
 
@@ -211,62 +217,76 @@ async def analyze_play_sequence(
 
 ═══ BROADCAST PROFILE ═══
 • Camera: Fixed elevated wide-angle, full-court view from scorer's table side
-• Scoreboard: Bottom-RIGHT corner — team name + score + clock + quarter ("1st", "2nd", etc.)
-• TITANS jersey color: {titans_jersey_color} (light gray or white)
+• Scoreboard: Bottom-RIGHT corner — team name + score + clock + quarter
+• TITANS jersey color: {titans_jersey_color}
 • RIVAL jersey color: {rival_jersey_color}
 • Referee: Black shirt. Scorer's table crew: white shirts.
+
+IMPORTANT JERSEY NOTE: The TITANS always wear {titans_jersey_color} jerseys.
+If you see jerseys that look similar to {titans_jersey_color} (even if lighting makes them appear darker or lighter), those are TITANS players.
+The rival team always wears {rival_jersey_color}. If jerseys look clearly different from the Titans color, those are rivals.
 
 ═══ WHAT HAPPENED ═══
 {score_summary}
 Timestamp: {video_ts}
 {crop_instructions}
 
-═══ TITANS ROSTER ═══
+═══ TITANS ROSTER WITH PHYSICAL PROFILES ═══
 {roster_str}
 
-═══ YOUR TASK ═══
-Step 1 — TEAM CONFIRMATION: Confirm WHICH team scored based on jersey color near the basket.
-Step 2 — PLAYER IDENTIFICATION: Use every available signal:
-  a) Jersey NUMBER on shirt (front or back) — even partially visible numbers count
-  b) Physical appearance: height, build, skin tone, hair
-  c) Court position: Who is at the foul line (FT)? Who is in the paint (2PT)? Who is at the arc (3PT)?
-  d) Post-play behavior: The scorer often pumps fist, raises arms, looks at bench
-  e) Team huddle: After play, teammates often rush to the scorer
-  f) Any TEXT OVERLAYS: Player name graphics, "FOUL ON #X", scoreboard text
-  g) Player profiles if provided (height, position tendency, etc.)
+═══ IDENTIFICATION METHOD — USE ALL OF THESE ═══
+Use EVERY available signal in order of reliability:
 
-Step 3 — SECONDARY EVENTS: Also look for:
-  • Rebounds after misses (who catches the ball?)
-  • Assists (who passed to the scorer right before?)
-  • Steals or blocks (if clearly visible)
-  • Team fouls on the scoreboard (did it increment?)
+1. JERSEY NUMBER (best) — Look at front AND back of jersey. Even partial numbers help.
+   For dark jerseys: look for lighter digits. For light jerseys: look for dark digits.
+   A "3" + "?" = could be #30, #31, #3. Narrow it down by position/build.
 
+2. PHYSICAL BUILD (very useful) — Height relative to teammates, body type.
+   If someone is the tallest player on the Titans → likely the center.
+   If someone is the shortest/quickest → likely the point guard.
+   Compare builds between players in frame.
+
+3. COURT POSITION (use for FT/2PT/3PT) —
+   FREE THROWS: 1-2 players at foul line, rest behind restraining line. Shooter = center.
+   2-POINTER: scorer was in or near the paint.
+   3-POINTER: scorer was beyond the arc, outside the lane.
+
+4. POST-PLAY BEHAVIOR — The scorer usually: raises arms, fist pumps, looks at bench.
+   Teammates rush to congratulate THE scorer specifically.
+
+5. BROADCAST TEXT OVERLAYS — Check for player name graphics, "FOUL ON #X", substitution text.
+   These are 100% reliable when visible.
+
+6. GAME CONTEXT — Who has been scoring in previous plays? Who is the team's main scorer?
+
+═══ WHAT TO RETURN ═══
 Return ONLY valid JSON:
 {{
   "events": [
     {{
       "player": "exact name from roster, or UNKNOWN_TITANS, or RIVAL",
       "team": "titans" or "rival",
-      "stat": "2PT_MADE|3PT_MADE|FT_MADE|2PT_MISS|3PT_MISS|FT_MISS|REB_OFF|REB_DEF|AST|STL|BLK|FOUL",
+      "stat": "2PT_MADE|3PT_MADE|FT_MADE|2PT_MISS|3PT_MISS|FT_MISS|REB_OFF|REB_DEF|AST|BLK|FOUL",
       "confidence": 0.0 to 1.0,
-      "reasoning": "specific visual evidence: jersey color + number + position + behavior"
+      "reasoning": "list WHICH signals you used: jersey#, build, position, behavior, text overlay, etc."
     }}
   ],
-  "jersey_numbers_seen": {{}},
+  "jersey_numbers_seen": {{"number": "player name or team"}},
   "titans_jersey_visible": true or false,
-  "play_description": "one sentence describing the play"
+  "play_description": "one sentence"
 }}
 
-Confidence:
-• 0.9+: jersey # clearly visible + matches a known play
-• 0.75-0.9: jersey partially readable OR physical match + position match
-• 0.6-0.75: team confirmed (jersey color) + strong positional inference
-• 0.5-0.6: team confirmed but player uncertain → use UNKNOWN_TITANS
-• <0.5: do not include"""
+Confidence scale:
+• 0.90+: jersey number clearly visible AND matches roster
+• 0.80-0.90: jersey number partially visible OR 2+ physical signals match one player
+• 0.70-0.80: team confirmed + position + build match one player
+• 0.60-0.70: team confirmed + at least one physical signal narrows to 1-2 players
+• 0.55-0.60: team confirmed but player genuinely uncertain → use UNKNOWN_TITANS
+• below 0.55: omit the event entirely"""
 
     try:
-        # Build content: full frames first, then crop zooms, then prompt
         content = []
+        # Send all frames
         for path in frame_paths:
             content.append({
                 "type": "image",
@@ -274,17 +294,25 @@ Confidence:
                            "data": _encode_frame(path, max_dim=720)}
             })
 
-        # Add crop zoom images (labeled via text)
+        # Multiple crops: key area + high-contrast version for dark jerseys
         if crop_regions and frame_paths:
-            # Use the middle frame for cropping (most likely to show the play)
             mid_frame = frame_paths[len(frame_paths) // 2]
-            content.append({"type": "text", "text": "=== ZOOMED CROP OF KEY AREA ==="})
+            last_frame = frame_paths[-1]
+            content.append({"type": "text", "text": "=== ZOOMED CROPS — look for jersey numbers and physical details ==="})
             for region in crop_regions:
+                # Normal zoom
                 cropped = _crop_and_encode(mid_frame, region, zoom=2.5)
-                content.append({
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": "image/jpeg", "data": cropped}
-                })
+                content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": cropped}})
+                # High-contrast version (helps read dark jerseys)
+                cropped_hc = _crop_and_encode_high_contrast(mid_frame, region, zoom=2.5)
+                if cropped_hc:
+                    content.append({"type": "text", "text": "↑ High-contrast version of same crop (may reveal jersey numbers on dark jerseys):"})
+                    content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": cropped_hc}})
+            # Also crop last frame (post-play celebration — easier to ID scorer)
+            content.append({"type": "text", "text": "=== POST-PLAY FRAME (scorer celebrating) ==="})
+            for region in crop_regions:
+                cropped_last = _crop_and_encode(last_frame, region, zoom=2.5)
+                content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": cropped_last}})
 
         content.append({"type": "text", "text": prompt})
 
@@ -296,15 +324,43 @@ Confidence:
             ).content[0].text
 
         loop = asyncio.get_event_loop()
-        raw = await loop.run_in_executor(None, _call)
+        raw = await asyncio.wait_for(loop.run_in_executor(None, _call), timeout=90)
         raw = re.sub(r"```(?:json)?\s*", "", raw.strip()).strip()
         s, e = raw.find('{'), raw.rfind('}')
         if s != -1 and e != -1:
             data = json.loads(raw[s:e+1])
             return data.get("events", []), data.get("jersey_numbers_seen", {}), data.get("play_description", "")
+    except asyncio.TimeoutError:
+        print(f"Play sequence timeout after 90s — skipping")
     except Exception as err:
         print(f"Play sequence error: {err}")
     return [], {}, ""
+
+
+def _crop_and_encode_high_contrast(frame_path: str, region: tuple, zoom: float = 2.5, quality: int = 85) -> str | None:
+    """
+    Same as _crop_and_encode but applies contrast enhancement.
+    Critical for reading numbers on dark (black/navy) jerseys.
+    Applies: brightness boost + contrast stretch + sharpen.
+    """
+    try:
+        from PIL import ImageEnhance, ImageFilter, ImageOps
+        img = Image.open(frame_path).convert("RGB")
+        w, h = img.size
+        l, t, r, b = int(region[0]*w), int(region[1]*h), int(region[2]*w), int(region[3]*h)
+        crop = img.crop((l, t, r, b))
+        zoomed = crop.resize((max(int((r-l)*zoom), 120), max(int((b-t)*zoom), 120)), Image.LANCZOS)
+        # Enhance contrast and sharpness to reveal jersey numbers
+        zoomed = ImageEnhance.Contrast(zoomed).enhance(2.0)
+        zoomed = ImageEnhance.Sharpness(zoomed).enhance(2.5)
+        zoomed = ImageEnhance.Brightness(zoomed).enhance(1.3)
+        # Auto-level (stretch histogram)
+        zoomed = ImageOps.autocontrast(zoomed, cutoff=2)
+        buf = io.BytesIO()
+        zoomed.save(buf, "JPEG", quality=quality)
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return None
 
 
 def _compress_frame(path: str, max_dim: int = 480) -> bytes:
@@ -380,7 +436,7 @@ Use null if not visible. Numbers only, no extra text."""
             ).content[0].text
 
         loop = asyncio.get_event_loop()
-        raw = await loop.run_in_executor(None, _call)
+        raw = await asyncio.wait_for(loop.run_in_executor(None, _call), timeout=30)
         raw = re.sub(r"```(?:json)?\s*", "", raw.strip()).strip()
         s = raw.find('{')
         e = raw.rfind('}')
@@ -408,6 +464,8 @@ Use null if not visible. Numbers only, no extra text."""
                 "quarter": d.get("quarter"),
                 "clock": d.get("clock"),
             }
+    except asyncio.TimeoutError:
+        print(f"quick_score_check: 30s timeout — skipping frame")
     except Exception as e:
         print(f"quick_score_check: {e}")
     return {"titans": None, "rival": None, "quarter": None, "clock": None}
@@ -422,7 +480,11 @@ async def scan_frame_for_jerseys(frame_path: str, players: list[str], jersey_map
     roster_str = "\n".join(f"  - {p}" for p in players)
     already_known = "\n".join(f"  #{k} = {v}" for k, v in jersey_map.items()) if jersey_map else "  (none yet)"
 
+    titans_color_hint = jersey_map.get("_titans_color", "gray/white")
     prompt = f"""Scan this basketball frame for jersey numbers. This may be a warmup, timeout, or sideline shot where players are CLOSE to the camera.
+
+TITANS jersey color: {titans_color_hint} — even if the lighting makes them look darker or brighter, these are still the same jerseys.
+IMPORTANT: The high-contrast crops show the SAME image with enhanced brightness/contrast — this helps reveal numbers on dark jerseys.
 
 Titans roster (find jersey numbers for as many as possible):
 {roster_str}
@@ -431,21 +493,21 @@ Already known jersey → player mappings:
 {already_known}
 
 INSTRUCTIONS:
-1. Look at EVERY visible jersey number in the frame
-2. For Titans players (gray/white jerseys): read the number, match to roster name if possible
-3. A player's number is on their CHEST and BACK
-4. Even if partially obscured, write down what you can read
-5. Note physical description to help match to roster (height, build, hair, skin)
+1. Look at EVERY visible jersey number in the frame AND in the zoomed/high-contrast crops
+2. For Titans players: read the number on chest or back
+3. Even if partially obscured, write down what you can read (partial is better than nothing)
+4. Note physical description: height, build, hair color, skin tone, body shape
+5. If number is not readable, STILL describe the player physically — this helps us identify them later
 
 Return ONLY valid JSON:
 {{
   "jerseys_found": [
     {{
-      "number": "7",
+      "number": "7 or partial like '3?' or null if unreadable",
       "team": "titans" or "rival",
       "confidence": 0.0 to 1.0,
-      "player_name": "exact roster name or null",
-      "description": "tall, dark hair, light skin — standing near scorer table"
+      "player_name": "exact roster name or null if uncertain",
+      "description": "tall, dark curly hair, light skin, broad shoulders — standing near scorer table"
     }}
   ],
   "close_up": true or false,
@@ -453,28 +515,31 @@ Return ONLY valid JSON:
 }}"""
 
     try:
-        img_data = _encode_frame(frame_path, max_dim=720, quality=85)
-        # Also add zoomed crops of left and right sides (where players often stand)
-        left_crop = _crop_and_encode(frame_path, (0.0, 0.1, 0.5, 0.9), zoom=2.0)
-        right_crop = _crop_and_encode(frame_path, (0.5, 0.1, 1.0, 0.9), zoom=2.0)
+        img_data    = _encode_frame(frame_path, max_dim=720, quality=85)
+        left_crop   = _crop_and_encode(frame_path, (0.0, 0.1, 0.5, 0.9), zoom=2.0)
+        right_crop  = _crop_and_encode(frame_path, (0.5, 0.1, 1.0, 0.9), zoom=2.0)
+        # High-contrast only for center (best jersey-number area)
+        center_hc   = _crop_and_encode_high_contrast(frame_path, (0.25, 0.1, 0.75, 0.9), zoom=2.0) or left_crop
 
         def _call():
             return get_client().messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=600,
+                max_tokens=800,
                 messages=[{"role": "user", "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_data}},
                     {"type": "text", "text": "Full frame:"},
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": left_crop}},
-                    {"type": "text", "text": "Zoomed left side:"},
+                    {"type": "text", "text": "Left side zoomed:"},
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": right_crop}},
-                    {"type": "text", "text": "Zoomed right side:"},
+                    {"type": "text", "text": "Right side zoomed:"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": center_hc}},
+                    {"type": "text", "text": "Center HIGH-CONTRAST (helps read jersey numbers):"},
                     {"type": "text", "text": prompt},
                 ]}]
             ).content[0].text
 
         loop = asyncio.get_event_loop()
-        raw = await loop.run_in_executor(None, _call)
+        raw = await asyncio.wait_for(loop.run_in_executor(None, _call), timeout=75)
         raw = re.sub(r"```(?:json)?\s*", "", raw.strip()).strip()
         s, e = raw.find('{'), raw.rfind('}')
         if s != -1 and e != -1:
@@ -779,15 +844,16 @@ Confidence guide:
             ).content[0].text
 
         loop = asyncio.get_event_loop()
-        raw = await loop.run_in_executor(None, _call)
+        raw = await asyncio.wait_for(loop.run_in_executor(None, _call), timeout=60)
         raw = re.sub(r"```(?:json)?\s*", "", raw.strip()).strip()
         s, e = raw.find('{'), raw.rfind('}')
         if s != -1 and e != -1:
             result = json.loads(raw[s:e+1])
-            # Auto-fill player name from jersey_map if not already set
             if result.get("jersey_number") and not result.get("player_name"):
                 result["player_name"] = jersey_map.get(str(result["jersey_number"]))
             return result
+    except asyncio.TimeoutError:
+        print(f"referee analysis timeout — skipping")
     except Exception as err:
         print(f"referee analysis error: {err}")
     return {"foul_called": False}

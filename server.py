@@ -532,10 +532,10 @@ async def smart_scan_pipeline(url: str, sid: str, players: list[str], jersey_map
                         change_fmt,
                     )
 
-                    # Update learned jersey map
                     if new_jerseys:
-                        learned_jerseys.update(new_jerseys)
-                        await manager.send(sid, {"type": "jersey_update", "map": learned_jerseys})
+                        named = {k: v for k, v in new_jerseys.items() if v in players}
+                        learned_jerseys.update(named)
+                        await manager.send(sid, {"type": "jersey_update", "map": dict(learned_jerseys)})
 
                     for ev in events:
                         player = ev.get("player", "UNKNOWN")
@@ -650,6 +650,7 @@ async def full_auto_pipeline(
     clock_same_count     = 0
     timeout_frames_analyzed = set()
     analyzed_whistles    = set()
+    score_event_times    = []   # rolling window for anti-replay filter
     titans_color         = titans_jersey_color
     rival_color          = rival_jersey_color
     quarter_break_scanned = set()
@@ -699,17 +700,20 @@ async def full_auto_pipeline(
         size_mb = os.path.getsize(video_path) // 1048576
         await status(f"✓ Video downloaded ({size_mb}MB, {duration//60}m {duration%60}s)")
 
-        # ─── PHASE 1: Detect jersey colors from first readable frame ──────
+        # ─── PHASE 1: Auto-detect RIVAL color only — NEVER override Titans color ──
+        # The Titans coach/operator always knows their own jersey color better than AI.
+        # AI auto-detection fails in low light, away games, or dark/navy uniforms.
         first_frame = os.path.join(work_dir, "first_frame.jpg")
         ok = await loop.run_in_executor(None, extract_frame_local, video_path, 90, first_frame)
-        if ok and not jersey_map:
-            await status("🎨 Detecting team jersey colors...")
+        if ok:
+            await status("🎨 Detecting rival jersey color...")
             colors = await detect_team_jersey_colors(first_frame)
-            if colors.get("titans_color"):
-                titans_color = colors["titans_color"]
-                rival_color  = colors.get("rival_color", rival_color)
-                rival_name   = colors.get("rival_name", "")
-                await status(f"✓ Titans = {titans_color} jerseys | {rival_name or 'Rival'} = {rival_color}")
+            rival_name = colors.get("rival_name", "")
+            # Only auto-fill rival color if not already specified
+            if not rival_color or rival_color in ("colored", "yellow", ""):
+                rival_color = colors.get("rival_color", rival_color) or "unknown"
+            # titans_color is ALWAYS what the user specified — never auto-overridden
+            await status(f"✓ Titans jerseys: {titans_color} (user-defined) | {rival_name or 'Rival'} = {rival_color}")
 
         # ─── PHASE 2: Warmup scan (first 10 min → jersey number extraction) ──
         warmup_end = min(600, duration // 2)
@@ -717,43 +721,86 @@ async def full_auto_pipeline(
             await status(f"🔍 Warmup scan: scanning first {warmup_end//60}m for jersey numbers...")
             await manager.send(sid, {"type": "auto_phase", "phase": "warmup"})
 
-            # Layer A: CV scan for close-up player crops (fast, no API call)
+            # Layer A: CV+PaddleOCR scan (YOLO tracks → torso crop → majority vote)
             if YOLO_AVAILABLE:
-                await status("🤖 YOLO player tracking active — highest accuracy mode", "success")
-            cv_close_ups = await loop.run_in_executor(
-                None, cv_scan_warmup, video_path, warmup_end, cv_classifier, 15
+                await status("🤖 YOLO + PaddleOCR jersey scan active — commercial-grade pipeline", "success")
+            cv_scan_result = await loop.run_in_executor(
+                None, cv_scan_warmup, video_path, warmup_end, cv_classifier, 5
             )
-            if cv_close_ups:
-                await status(f"📸 CV warmup: {len(cv_close_ups)} close-up player crops found for jersey reading")
-                # Feed best close-ups to Claude for jersey number reading
-                # Group by track_id, pick the largest bbox (most readable)
-                by_track = {}
-                for cu in cv_close_ups:
-                    tid = cu["track_id"]
-                    if tid not in by_track or cu["bbox"][3] > by_track[tid]["bbox"][3]:
-                        by_track[tid] = cu
-                # Ask Claude to read jersey numbers from the best crops
-                for tid, cu in list(by_track.items())[:10]:  # max 10 API calls
-                    crop = await loop.run_in_executor(
-                        None, extract_player_crop, video_path, cu["frame_idx"], cu["bbox"], 6
-                    )
-                    if crop is not None:
-                        import tempfile
-                        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False, dir=work_dir) as tf:
-                            import cv2 as _cv2
-                            _cv2.imwrite(tf.name, crop)
-                            crop_path = tf.name
-                        warmup_result = await scan_frame_for_jerseys(crop_path, players, learned_jerseys)
-                        try: os.remove(crop_path)
-                        except: pass
-                        updates = warmup_result.get("jersey_map_updates", {})
-                        for jnum, pname in updates.items():
-                            if jnum not in learned_jerseys:
-                                learned_jerseys[jnum] = pname
-                                warmup_track_to_player[tid] = pname
-                                await status(f"✓ CV+Claude: #{jnum} = {pname}", "success")
-                                await manager.send(sid, {"type": "jersey_update", "map": learned_jerseys})
-                        await asyncio.sleep(0.1)
+            cv_close_ups = []
+            paddle_jersey_votes = {}
+            if isinstance(cv_scan_result, dict):
+                cv_close_ups = cv_scan_result.get("closeup_frames", [])
+                paddle_jersey_votes = cv_scan_result.get("jersey_votes", {})
+            elif isinstance(cv_scan_result, list):
+                cv_close_ups = cv_scan_result  # legacy fallback
+
+            # ── Apply PaddleOCR majority-vote results directly (no Claude needed) ──
+            if paddle_jersey_votes:
+                await status(f"🔢 PaddleOCR: {len(paddle_jersey_votes)} tracked players → jersey vote results")
+                # Build number→player name map: match jersey numbers to player roster
+                for tid_str, votes in paddle_jersey_votes.items():
+                    if not votes:
+                        continue
+                    best_num, best_count = max(votes.items(), key=lambda x: x[1])
+                    if best_count < 3:  # need at least 3 agreeing frames
+                        continue
+                    if best_num in learned_jerseys:
+                        warmup_track_to_player[int(tid_str) if tid_str.isdigit() else tid_str] = learned_jerseys[best_num]
+                        continue
+                    # Try to match this jersey number to a player in the roster
+                    matched_player = None
+                    for p in players:
+                        hints = player_profiles.get(p, {})
+                        jersey_hint = str(hints.get("jersey_number", ""))
+                        if jersey_hint and jersey_hint == best_num:
+                            matched_player = p
+                            break
+                    if matched_player:
+                        learned_jerseys[best_num] = matched_player
+                        warmup_track_to_player[int(tid_str) if tid_str.isdigit() else tid_str] = matched_player
+                        await status(f"✓ PaddleOCR: #{best_num} = {matched_player} ({best_count} frames)", "success")
+                        await manager.send(sid, {"type": "jersey_update", "map": learned_jerseys})
+                    else:
+                        # Jersey number seen but no roster match — store as "unknown#N"
+                        label = f"#jersey{best_num}"
+                        learned_jerseys[best_num] = label
+                        await status(f"👀 PaddleOCR: #{best_num} visible ({best_count} frames) — no roster match", "info")
+
+            # ── Claude fallback for players still unidentified (use best crop) ──
+            unidentified_tracks = {
+                cu["track_id"] for cu in cv_close_ups
+                if warmup_track_to_player.get(cu["track_id"]) is None
+            }
+            by_track = {}
+            for cu in cv_close_ups:
+                if cu["track_id"] not in unidentified_tracks:
+                    continue
+                tid = cu["track_id"]
+                if tid not in by_track or cu["bbox"][3] > by_track[tid]["bbox"][3]:
+                    by_track[tid] = cu
+
+            for tid, cu in list(by_track.items())[:6]:  # max 6 Claude API calls
+                crop = await loop.run_in_executor(
+                    None, extract_player_crop, video_path, cu["frame_idx"], cu["bbox"], 6
+                )
+                if crop is not None:
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False, dir=work_dir) as tf:
+                        import cv2 as _cv2
+                        _cv2.imwrite(tf.name, crop)
+                        crop_path = tf.name
+                    warmup_result = await scan_frame_for_jerseys(crop_path, players, learned_jerseys)
+                    try: os.remove(crop_path)
+                    except: pass
+                    updates = warmup_result.get("jersey_map_updates", {})
+                    for jnum, pname in updates.items():
+                        if jnum not in learned_jerseys:
+                            learned_jerseys[jnum] = pname
+                            warmup_track_to_player[tid] = pname
+                            await status(f"✓ CV+Claude: #{jnum} = {pname}", "success")
+                            await manager.send(sid, {"type": "jersey_update", "map": learned_jerseys})
+                    await asyncio.sleep(0.1)
 
             # Layer B: Claude warmup scan (whole frames for remaining jerseys)
             warmup_timestamps = list(range(30, warmup_end, 30))
@@ -806,13 +853,51 @@ async def full_auto_pipeline(
             if f"auto_{sid}" not in active_tasks:
                 break
 
+            if i < 5 or i % 50 == 0:
+                print(f"[SCAN] frame {i} ts={ts}s ({ts//60}:{ts%60:02d})", flush=True)
+
             # ── Extract frame (fast local ffmpeg, ~0.04s) ─────────────────
             ok = await loop.run_in_executor(None, extract_frame_local, video_path, ts, frame_path)
             if not ok:
                 continue
 
+            # ── Continuous jersey OCR every 20 frames (PaddleOCR in-game) ──
+            if YOLO_AVAILABLE and i % 20 == 0:
+                try:
+                    import cv2 as _cv2
+                    _frame = _cv2.imread(frame_path)
+                    if _frame is not None:
+                        from tracker import _paddle_read_number, _torso_crop_and_enhance, _get_paddle
+                        if _get_paddle() is not None:
+                            _pt = PlayerTracker(cv_classifier)
+                            _detections = _pt.process_frame(_frame, ts * 30)
+                            _fh = _frame.shape[0]
+                            for _p in _detections:
+                                if _p["team"] != "titans":
+                                    continue
+                                _bx, _by, _bw, _bh = _p["bbox"]
+                                if _bh < _fh * 0.08:
+                                    continue
+                                _torso = _torso_crop_and_enhance(_frame, (_bx, _by, _bw, _bh))
+                                _num = _paddle_read_number(_torso)
+                                if _num and _num not in learned_jerseys:
+                                    # Try to match to roster
+                                    for _pname in players:
+                                        _hints = player_profiles.get(_pname, {})
+                                        if str(_hints.get("jersey_number", "")) == _num:
+                                            learned_jerseys[_num] = _pname
+                                            warmup_track_to_player[_p["id"]] = _pname
+                                            await status(f"✓ In-game OCR: #{_num} = {_pname} @{ts//60}:{ts%60:02d}", "success")
+                                            await manager.send(sid, {"type": "jersey_update", "map": learned_jerseys})
+                                            break
+                except Exception:
+                    pass
+
             # ── Score check ───────────────────────────────────────────────
-            score = await quick_score_check(frame_path)
+            try:
+                score = await asyncio.wait_for(quick_score_check(frame_path), timeout=35)
+            except (asyncio.TimeoutError, Exception):
+                score = {}
             cur_t, cur_r = score.get("titans"), score.get("rival")
             cur_clock = score.get("clock")
             cur_q = score.get("quarter")
@@ -878,6 +963,30 @@ async def full_auto_pipeline(
             if last_score["rival"] is not None and cur_r is not None:
                 d = cur_r - last_score["rival"]
                 rival_delta = d if 0 < d <= 4 else 0
+
+            # Anti-replay filter: Copa Talento shows instant replays after every big play.
+            # A real basketball play needs at least 8 seconds of game clock to develop.
+            # If we see the same team delta again within 45s video time, it's a replay.
+            if titans_delta > 0 or rival_delta > 0:
+                replay_key_t = f"titans+{titans_delta}"
+                replay_key_r = f"rival+{rival_delta}"
+                now = ts
+                is_replay = False
+                for (rk, rt) in list(score_event_times):
+                    if now - rt < 45:
+                        if (titans_delta > 0 and rk == replay_key_t) or \
+                           (rival_delta > 0 and rk == replay_key_r):
+                            is_replay = True
+                            break
+                if is_replay:
+                    titans_delta, rival_delta = 0, 0
+                else:
+                    if titans_delta > 0:
+                        score_event_times.append((replay_key_t, now))
+                    if rival_delta > 0:
+                        score_event_times.append((replay_key_r, now))
+                # Expire entries older than 90 seconds
+                score_event_times = [(k, t) for k, t in score_event_times if now - t < 90]
             if cur_t is not None: last_score["titans"] = cur_t
             if cur_r is not None: last_score["rival"]  = cur_r
 
@@ -947,16 +1056,29 @@ async def full_auto_pipeline(
                     # ── Copa Talento Vision analysis with crop+zoom ────────
                     score_before = {"titans": (cur_t or 0) - titans_delta, "rival": (cur_r or 0) - rival_delta}
                     score_after  = {"titans": cur_t or 0, "rival": cur_r or 0}
-                    events, new_jerseys, play_desc = await analyze_play_sequence(
-                        fps, players, learned_jerseys, score_before, score_after, play_fmt,
-                        player_profiles=player_profiles,
-                        titans_jersey_color=titans_color,
-                        rival_jersey_color=rival_color,
-                    )
+                    try:
+                        events, new_jerseys, play_desc = await asyncio.wait_for(
+                            analyze_play_sequence(
+                                fps, players, learned_jerseys, score_before, score_after, play_fmt,
+                                player_profiles=player_profiles,
+                                titans_jersey_color=titans_color,
+                                rival_jersey_color=rival_color,
+                            ),
+                            timeout=90
+                        )
+                    except asyncio.TimeoutError:
+                        events, new_jerseys, play_desc = [], {}, ""
+                    except Exception as _ae:
+                        events, new_jerseys, play_desc = [], {}, ""
 
                     if new_jerseys:
-                        learned_jerseys.update(new_jerseys)
-                        await manager.send(sid, {"type": "jersey_update", "map": learned_jerseys})
+                        named = {k: v for k, v in new_jerseys.items() if v in players}
+                        descriptive = {k: v for k, v in new_jerseys.items() if v not in players and k not in learned_jerseys}
+                        learned_jerseys.update(named)
+                        # Send named + descriptive so UI can prompt user to assign unknown jersey numbers
+                        send_map = dict(learned_jerseys)
+                        send_map.update(descriptive)
+                        await manager.send(sid, {"type": "jersey_update", "map": send_map})
 
                     # Merge OCR + Claude jersey discoveries
                     for ev in events:
@@ -1007,9 +1129,15 @@ async def full_auto_pipeline(
 
                 if ffps:
                     await status(f"🚨 Whistle @{foul_fmt} — reading referee signal...", "info")
-                    foul_result = await analyze_referee_foul_sequence(
-                        ffps, players, learned_jerseys, foul_fmt
-                    )
+                    try:
+                        foul_result = await asyncio.wait_for(
+                            analyze_referee_foul_sequence(ffps, players, learned_jerseys, foul_fmt),
+                            timeout=60
+                        )
+                    except asyncio.TimeoutError:
+                        foul_result = {"foul_called": False}
+                    except Exception as _e:
+                        foul_result = {"foul_called": False}
                     if foul_result.get("foul_called") and foul_result.get("confidence", 0) >= 0.5:
                         player_name = (foul_result.get("player_name") or
                                        learned_jerseys.get(str(foul_result.get("jersey_number", ""))) or
@@ -1028,7 +1156,13 @@ async def full_auto_pipeline(
 
                     # ── Substitution detection at this whistle ────────────
                     current_on_court = list(on_court_log.keys())
-                    sub_result = await detect_substitution(ffps, players, learned_jerseys, current_on_court)
+                    try:
+                        sub_result = await asyncio.wait_for(
+                            detect_substitution(ffps, players, learned_jerseys, current_on_court),
+                            timeout=60
+                        )
+                    except (asyncio.TimeoutError, Exception):
+                        sub_result = {"substitution_detected": False}
                     if sub_result.get("substitution_detected") and sub_result.get("confidence", 0) >= 0.55:
                         sub_in  = sub_result.get("sub_in")
                         sub_out = sub_result.get("sub_out")

@@ -197,6 +197,8 @@ html, body { height: 100%; font-family: 'Helvetica Neue', Arial, sans-serif; bac
 .btn-sm { background: rgba(255,255,255,0.07); border: 1px solid var(--border); color: var(--text); border-radius: 5px; padding: 4px 10px; cursor: pointer; font-size: 0.75rem; }
 .btn-sm:hover { background: rgba(255,255,255,0.12); }
 .btn-sm.danger { color: var(--accent); }
+.unassigned-banner { position: fixed; top: 60px; left: 50%; transform: translateX(-50%); background: var(--navy3); border: 2px solid var(--gold); color: var(--text); padding: 10px 18px; border-radius: 10px; font-size: 0.88rem; z-index: 999; max-width: 480px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); animation: slideDown 0.3s ease; }
+@keyframes slideDown { from { opacity:0; transform: translateX(-50%) translateY(-10px); } to { opacity:1; transform: translateX(-50%) translateY(0); } }
 .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(20px); background: var(--navy3); color: var(--text); padding: 8px 20px; border-radius: 20px; font-size: 0.85rem; font-weight: 600; opacity: 0; transition: all 0.25s; pointer-events: none; z-index: 1000; white-space: nowrap; }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 .hidden { display: none !important; }
@@ -235,6 +237,8 @@ html, body { height: 100%; font-family: 'Helvetica Neue', Arial, sans-serif; bac
 .setup-row label { font-size: 0.7rem; color: var(--text2); white-space: nowrap; min-width: 90px; }
 .setup-input { flex: 1; background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 4px; color: var(--text); padding: 3px 7px; font-size: 0.75rem; width: 100%; }
 .setup-input:focus { border-color: var(--gold); outline: none; }
+.setup-tip { font-size: 0.72rem; color: var(--text2); background: rgba(241,196,15,0.08); border-left: 3px solid var(--gold); padding: 6px 10px; border-radius: 0 6px 6px 0; margin-top: 6px; line-height: 1.4; }
+.setup-tip code { background: rgba(255,255,255,0.1); padding: 1px 5px; border-radius: 3px; font-size: 0.85em; color: var(--gold); }
 .setup-textarea { width: 100%; min-height: 70px; background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 4px; color: var(--text); padding: 5px 7px; font-size: 0.72rem; resize: vertical; font-family: inherit; line-height: 1.5; }
 .setup-textarea:focus { border-color: var(--gold); outline: none; }
 .setup-textarea::placeholder { color: rgba(255,255,255,0.2); }
