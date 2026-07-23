@@ -6,3 +6,6 @@ __pycache__/
 frames/
 *.mp4
 *.webm
+
+# pesos de modelos (se re-descargan de ultralytics)
+*.pt
